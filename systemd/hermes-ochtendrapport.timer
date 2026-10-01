@@ -1,0 +1,9 @@
+[Unit]
+Description=Hermes: ochtendrapport elke dag (flow-config tijden.ochtendrapport)
+
+[Timer]
+OnCalendar=*-*-* @OCHTENDRAPPORT@:00 @TIJDZONE@
+Persistent=true
+
+[Install]
+WantedBy=timers.target

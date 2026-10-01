@@ -1,0 +1,122 @@
+From 6b58f662d052167e374d56ff2f38b9609f54d2b3 Mon Sep 17 00:00:00 2001
+From: Hermes Discord Flow <noreply@example.invalid>
+Date: Thu, 1 Oct 2026 08:53:47 +0000
+Subject: [PATCH 4/6] kanban: branchnaam van een projectkaart is altijd een
+ geldige git-ref
+
+branch_name_for() kapt de titelslug af op 40 tekens. Een titel met een punt
+("ca. 14 dagen") kon zo eindigen op '.', en punten konden ook '..' of
+'.lock' vormen. Git weigert zulke namen, dus de worker kon zijn worktree niet
+maken en de spawn mislukte zonder dat er een worker startte.
+
+- De titelslug bevat geen '.' meer.
+- _is_valid_branch() controleert de naam (pure-Python subset van
+  git check-ref-format --branch); is die ongeldig, dan valt de naam terug op
+  <project>/<kaart>.
+
+Tests: tests/hermes_cli/test_kanban_branch_ref.py (ook tegen de echte
+git check-ref-format als git aanwezig is).
+---
+ hermes_cli/projects_db.py                  | 18 ++++++-
+ tests/hermes_cli/test_kanban_branch_ref.py | 59 ++++++++++++++++++++++
+ 2 files changed, 75 insertions(+), 2 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_branch_ref.py
+
+diff --git a/hermes_cli/projects_db.py b/hermes_cli/projects_db.py
+index 02ac787140..81cb72546b 100644
+--- a/hermes_cli/projects_db.py
++++ b/hermes_cli/projects_db.py
+@@ -70,7 +70,10 @@ CREATE TABLE IF NOT EXISTS discovered_repos (
+ # stop traversal/path separators, loose enough for kebab-case. Display formatting lives in ``name``.
+ _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9\-_]{0,63}$")
+ # Deterministic branch slug: lowercase, separators collapsed, capped.
+-_BRANCH_SAFE_RE = re.compile(r"[^a-z0-9._-]+")
++# No "." in a title slug, so a branch name never gets "..", ".lock" or a
++# trailing "." (git refuses those; the 40-char cut could end a slug on a dot).
++_BRANCH_SAFE_RE = re.compile(r"[^a-z0-9_-]+")
++_REF_FORBIDDEN_RE = re.compile(r"[\x00-\x20\x7f~^:?*\[\\]")
+ _INITIALIZED_PATHS: set[str] = set()
+ # TEXT columns added to `projects` after v1; re-applied idempotently on every open so a legacy DB
+ # upgrades in place.
+@@ -482,4 +485,15 @@ def branch_name_for(project: Project, task_id: str, *, title: str = "") -> str:
+     task (stable and human-meaningful, replacing the random ``wt/<task-id>`` fallback)."""
+     base = f"{project.slug or _slugify(project.name)}/{task_id}"
+     tslug = _BRANCH_SAFE_RE.sub("-", str(title).strip().lower()).strip("-")[:40].strip("-") if title else ""
+-    return f"{base}-{tslug}" if tslug else base
++    name = f"{base}-{tslug}" if tslug else base
++    return name if _is_valid_branch(name) else base
++
++
++def _is_valid_branch(name: str) -> bool:
++    """Pure-Python subset of ``git check-ref-format --branch`` for the names built here
++    : no "..", "@{", control/space/~^:?*[\\ characters, no component that
++    starts with "." or ends with ".lock", no trailing "." or "/", no leading "-"."""
++    parts = name.split("/")
++    return (bool(name) and not name.startswith("-") and "@{" not in name and ".." not in name
++            and not _REF_FORBIDDEN_RE.search(name) and not name.endswith((".", "/"))
++            and all(p and not p.startswith(".") and not p.endswith(".lock") for p in parts))
+diff --git a/tests/hermes_cli/test_kanban_branch_ref.py b/tests/hermes_cli/test_kanban_branch_ref.py
+new file mode 100644
+index 0000000000..853aca2bd1
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_branch_ref.py
+@@ -0,0 +1,59 @@
++"""Project branch names are always valid git refs.
++
++``branch_name_for`` cuts the title slug at 40 characters. A title with a dot
++("ca. 14 days") could leave a trailing '.', and dots could also form '..' or
++'.lock' -- all refused by git, so the worker could not create its worktree.
++"""
++
++from __future__ import annotations
++
++import shutil
++import subprocess
++
++import pytest
++
++from hermes_cli import projects_db as pdb
++
++PROJECT = pdb.Project(id="p_1", slug="demo-app", name="Demo App", created_at=0)
++TASK = "t_0000abcd"
++
++TITLES = [
++    "F3-11 Recovery score, 28-day baseline ca. 14 days",
++    "a..b",
++    "release.lock",
++    ".hidden",
++    "x" * 39 + ".",
++    "trailing.",
++    "naïef: über",
++    "a@{b}",
++    "~^:?*[\\ spaties",
++    "...",
++    "",
++]
++
++
++def test_example_title_drops_trailing_dot():
++    assert pdb.branch_name_for(PROJECT, TASK, title=TITLES[0]) == (
++        "demo-app/t_0000abcd-f3-11-recovery-score-28-day-baseline-ca"
++    )
++
++
++@pytest.mark.parametrize("title", TITLES)
++def test_branch_name_passes_pure_python_check(title):
++    name = pdb.branch_name_for(PROJECT, TASK, title=title)
++    assert name.startswith(f"demo-app/{TASK}")
++    assert "." not in name.split("/", 1)[1]
++    assert pdb._is_valid_branch(name)
++
++
++@pytest.mark.skipif(shutil.which("git") is None, reason="git not installed")
++@pytest.mark.parametrize("title", TITLES)
++def test_branch_name_is_accepted_by_git(title):
++    name = pdb.branch_name_for(PROJECT, TASK, title=title)
++    rc = subprocess.run(["git", "check-ref-format", "--branch", name], capture_output=True).returncode
++    assert rc == 0, name
++
++
++@pytest.mark.parametrize("bad", ["a..b", "x/.y", "x/y.lock", "x.", "x/", "-x", "a@{b", "a b", "a:b", ""])
++def test_validator_rejects_git_invalid_names(bad):
++    assert not pdb._is_valid_branch(bad)

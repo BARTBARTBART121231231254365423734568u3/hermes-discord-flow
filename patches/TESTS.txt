@@ -1,0 +1,57 @@
+Tests per patch (paden relatief aan de Hermes-checkout)
+=========================================================
+
+required/0001  kanban: wachtstand ('Wacht op …')
+               tests/hermes_cli/test_kanban_wait_status.py
+required/0002  kanban: lusdetectie per oorzaak, eigenaarsvraag geen lus
+               tests/hermes_cli/test_kanban_owner_question_block.py
+               tests/hermes_cli/test_kanban_block_cause.py
+               (upstream, moet groen blijven) tests/hermes_cli/test_kanban_block_kinds.py
+required/0003  discord: antwoordknoppen op vragen
+               tests/gateway/test_discord_question_buttons.py
+required/0004  discord: 💾-melding optioneel uit Discord
+               tests/gateway/test_discord_self_improvement_notice.py
+
+recommended/   (leeg)
+
+optional/0001  kanban: verouderde taakbranch bijwerken vóór start
+               tests/hermes_cli/test_kanban_worktree_refresh.py
+optional/0002  kanban: implementer reviewt nooit zijn eigen kaart
+               tests/hermes_cli/test_kanban_review_self_guard.py
+optional/0003  agent: instructie-vingerafdruk
+               tests/agent/test_instruction_fingerprint.py
+optional/0004  kanban: branchnaam is altijd een geldige git-ref
+               tests/hermes_cli/test_kanban_branch_ref.py
+optional/0005  kanban: specify --keep-body
+               tests/hermes_cli/test_kanban_specify.py
+optional/0006  kanban: kaart van een worker erft het project
+               tests/tools/test_kanban_create_inherit_project.py
+
+Commando
+--------
+Draai vanuit de Hermes-checkout, met de Python van de Hermes-venv (HERMES_PY) en pytest beschikbaar.
+`env -i` houdt HERMES_*-variabelen van een draaiende installatie buiten de tests; de tests zetten zelf een
+tijdelijke HERMES_HOME.
+
+  cd <hermes-checkout>
+  env -i HOME="$HOME" PATH=/usr/bin:/bin LANG=C.UTF-8 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD" \
+    "$HERMES_PY" -m pytest -q -p no:cacheprovider -o addopts='' \
+    tests/hermes_cli/test_kanban_wait_status.py \
+    tests/hermes_cli/test_kanban_owner_question_block.py \
+    tests/hermes_cli/test_kanban_block_cause.py \
+    tests/hermes_cli/test_kanban_block_kinds.py \
+    tests/gateway/test_discord_question_buttons.py \
+    tests/gateway/test_discord_self_improvement_notice.py
+
+Met --met-optioneel komen daar bij:
+
+    tests/hermes_cli/test_kanban_worktree_refresh.py \
+    tests/hermes_cli/test_kanban_review_self_guard.py \
+    tests/agent/test_instruction_fingerprint.py \
+    tests/hermes_cli/test_kanban_branch_ref.py \
+    tests/hermes_cli/test_kanban_specify.py \
+    tests/tools/test_kanban_create_inherit_project.py
+
+Staat pytest niet in de Hermes-venv, zet dan de site-packages van een losse pytest-venv achter $PWD in PYTHONPATH.
+De tests van deze patches hebben geen async-plugin nodig. Veel upstream-tests van de Discord-adapter wel
+(@pytest.mark.asyncio): draai die met pytest-asyncio geïnstalleerd, anders falen ze ook zonder deze patches.

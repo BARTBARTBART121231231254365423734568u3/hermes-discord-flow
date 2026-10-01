@@ -1,0 +1,145 @@
+From 30e12411657f2a898b6fa0442a5440765732d558 Mon Sep 17 00:00:00 2001
+From: Hermes Discord Flow <noreply@example.invalid>
+Date: Thu, 1 Oct 2026 08:45:34 +0000
+Subject: [PATCH 1/4] =?UTF-8?q?kanban:=20wachtstand=20('Wacht=20op=20?=
+ =?UTF-8?q?=E2=80=A6')=20als=20reden=20van=20een=20geblokkeerde=20kaart?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Na een antwoord van de eigenaar blijft een kaart soms geblokkeerd, bijvoorbeeld
+omdat ze op een nachtelijke run wacht. Tot nu toe bleef dan de oorspronkelijke
+vraag als blokkadereden staan, zodat een beantwoorde vraag er nog open uitzag.
+
+- block_task() op een kaart die al geblokkeerd is, accepteert een reden die
+  begint met "Wacht op" (hoofdletterongevoelig) als pure statusupdate:
+  status, block_kind en de lusteller (block_recurrences) blijven gelijk.
+  Het event 'blocked' krijgt "status_update": true, zodat lusdetectie en de
+  Discord-vragenknoppen deze update herkennen.
+- De samenvatting van de laatste run krijgt dezelfde reden; het bord toont
+  die als bloktekst. De oorspronkelijke vraag blijft in het eerdere event.
+- Elke andere reden op een geblokkeerde kaart blijft geweigerd, net als een
+  wachtstand met een ander block_kind of met expected_run_id.
+
+Tests: tests/hermes_cli/test_kanban_wait_status.py
+---
+ hermes_cli/kanban_db.py                     | 19 ++++++
+ tests/hermes_cli/test_kanban_wait_status.py | 72 +++++++++++++++++++++
+ 2 files changed, 91 insertions(+)
+ create mode 100644 tests/hermes_cli/test_kanban_wait_status.py
+
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 5520ded607..bf18ac688b 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -3205,6 +3205,9 @@ def edit_task(
+     return True
+ 
+ 
++WAIT_STATUS_PREFIX = "wacht op"  # see block_task: reason-only update of a blocked card
++
++
+ def block_task(
+     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
+     kind: Optional[str] = None, expected_run_id: Optional[int] = None,
+@@ -3239,6 +3242,22 @@ def block_task(
+         # asserting run ownership (``expected_run_id``) cannot own a parked
+         # card -- its run is over -- so it is refused like any stale worker.
+         if cur_row["status"] == "blocked":
++            # After the owner answered, the manager rewrites the reason to the real wait state
++            # ("Wacht op nachtrun 23:00 – antwoord A gegeven") so an answered question never looks open.
++            # Reason only: status, block_kind and the loop counter stay exactly as they are.
++            if (reason and reason.strip().lower().startswith(WAIT_STATUS_PREFIX) and expected_run_id is None
++                    and _row_get(cur_row, "block_kind") is not None
++                    and kind in (None, _row_get(cur_row, "block_kind"))):
++                _append_event(conn, task_id, "blocked", {
++                    "kind": _row_get(cur_row, "block_kind"), "reason": reason, "status_update": True,
++                })
++                # The board shows the latest run's summary as the block text: without this, an answered
++                # question keeps showing there. The original question stays in the earlier blocked event.
++                last_run = conn.execute("SELECT id FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
++                                        (task_id,)).fetchone()
++                if last_run is not None:
++                    conn.execute("UPDATE task_runs SET summary = ? WHERE id = ?", (reason, last_run[0]))
++                return True
+             if kind is None or expected_run_id is not None or _row_get(cur_row, "block_kind") is not None:
+                 return False
+             classified = conn.execute(
+diff --git a/tests/hermes_cli/test_kanban_wait_status.py b/tests/hermes_cli/test_kanban_wait_status.py
+new file mode 100644
+index 0000000000..66601307c2
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_wait_status.py
+@@ -0,0 +1,72 @@
++"""Rewriting the reason of a blocked card to its wait state ("Wacht op …").
++
++After the owner answered, the card may stay blocked (e.g. waiting on a nightly run). The manager
++rewrites the reason so the answered question never looks open; status, block_kind and the loop
++counter must not change, and any other reason on a blocked card is still refused.
++"""
++
++from __future__ import annotations
++
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++
++
++@pytest.fixture
++def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    kb.init_db()
++    return home
++
++
++def _blocked_question(conn) -> str:
++    tid = kb.create_task(conn, title="t", assignee="worker")
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
++    assert kb.claim_task(conn, tid, claimer="worker") is not None
++    assert kb.block_task(conn, tid, reason="Vraag voor de eigenaar: A of B?", kind="needs_input")
++    return tid
++
++
++def _last_reason(conn, tid) -> str:
++    return [e for e in kb.list_events(conn, tid) if e.kind == "blocked"][-1].payload["reason"]
++
++
++def test_wait_status_rewrites_reason_only(kanban_home: Path) -> None:
++    with kbc.connect_closing() as conn:
++        tid = _blocked_question(conn)
++        before = kb.get_task(conn, tid)
++        assert kb.block_task(conn, tid, reason="Wacht op nachtrun 23:00 – antwoord A gegeven")
++        after = kb.get_task(conn, tid)
++        assert (after.status, after.block_kind, after.block_recurrences) == (
++            "blocked", before.block_kind, before.block_recurrences)
++        assert _last_reason(conn, tid).startswith("Wacht op nachtrun")
++
++
++def test_other_reason_on_blocked_card_still_refused(kanban_home: Path) -> None:
++    with kbc.connect_closing() as conn:
++        tid = _blocked_question(conn)
++        assert not kb.block_task(conn, tid, reason="Vraag voor de eigenaar: nog een vraag?", kind="needs_input")
++        assert _last_reason(conn, tid) == "Vraag voor de eigenaar: A of B?"
++
++
++def test_wait_status_with_other_kind_refused(kanban_home: Path) -> None:
++    with kbc.connect_closing() as conn:
++        tid = _blocked_question(conn)
++        assert not kb.block_task(conn, tid, reason="Wacht op iets", kind="capability")
++
++
++def test_wait_status_also_replaces_last_run_summary(kanban_home: Path) -> None:
++    with kbc.connect_closing() as conn:
++        tid = _blocked_question(conn)
++        assert kb.block_task(conn, tid, reason="Wacht op nachtrun – antwoord A gegeven")
++        summary = conn.execute("SELECT summary FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1", (tid,)).fetchone()[0]
++        assert summary == "Wacht op nachtrun – antwoord A gegeven"
++        assert any((e.payload or {}).get("reason") == "Vraag voor de eigenaar: A of B?"
++                   for e in kb.list_events(conn, tid) if e.kind == "blocked")

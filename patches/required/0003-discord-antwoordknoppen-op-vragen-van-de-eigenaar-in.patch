@@ -1,0 +1,670 @@
+From 3667eda23d5ae363c748d0d6cb07a48899f16bda Mon Sep 17 00:00:00 2001
+From: Hermes Discord Flow <noreply@example.invalid>
+Date: Thu, 1 Oct 2026 08:49:47 +0000
+Subject: [PATCH 3/4] discord: antwoordknoppen op vragen van de eigenaar in een
+ forumpost
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Een externe poster (geen onderdeel van deze patch) zet per open vraag een
+forumpost met knoppen. De custom_id is tq:<kaart>:<episode>:<n> voor optie n
+en tq:<kaart>:<episode>:x voor "✏️ Anders…"; <episode> is het id van het
+kanban-event 'blocked' dat de vraag stelde. Omdat de knoppen via REST gepost
+worden, is er geen discord.ui.View: de adapter handelt ze in on_interaction
+af op custom_id, ook na een herstart van de gateway.
+
+- Alleen decision_owner_id (één of meer Discord-user-id's, kommagescheiden)
+  mag antwoorden; anderen krijgen "Alleen {label} kan deze vraag
+  beantwoorden." en er gaat niets naar de agent.
+- Een klik wordt eerst bevestigd (defer, binnen de 3 seconden van Discord).
+  Daarna gaat het antwoord als gewoon bericht naar de agent van die post:
+  "Antwoord van {label} (knop): optie N — <knoplabel>". De eigenaar krijgt
+  "✅ Ontvangen". Pas daarna verdwijnen de knoppen ("✅ Gekozen: …") en krijgt
+  de post het label "beantwoord" (labels "open"/"beantwoord"/"verwerkt"
+  worden vervangen, andere labels blijven). Lukt het doorgeven niet, dan
+  krijgt de eigenaar "Lukt niet, typ je antwoord in de post." en blijven de
+  knoppen staan.
+- "Anders…" opent een invulveld met custom_id tqm:<kaart>:<episode>. Het
+  versturen wordt op id afgehandeld (geen geheugenstatus), dus een veld dat
+  tijdens een herstart open stond, werkt nog. Het antwoord gaat als
+  "Antwoord van {label} (anders): <tekst>" naar de agent.
+- Vóór het accepteren controleert de handler (alleen-lezen) op het kanbanbord
+  of de kaart nog geblokkeerd is op precies deze vraag: het laatste echte
+  'blocked'-event moet de episode zijn, en een wachtstand-update
+  ("status_update") telt als beantwoord. Zo niet, dan: "Deze vraag is al
+  beantwoord of vervangen door een nieuwere vraag…", en er gaat niets naar
+  de agent. Is het bord onleesbaar, dan wordt het antwoord geaccepteerd.
+- Het bijgewerkte vraagbericht blijft onder de 1900 tekens (Discord: 2000).
+
+Config (platforms.discord, komt in extra):
+  decision_owner_id, question_owner_label (standaard "de eigenaar"),
+  question_tags {open, beantwoord, verwerkt}, question_board (standaard het
+  huidige bord), question_texts (overschrijft de Nederlandse teksten).
+
+Vereist de wachtstand-patch (status_update in het event 'blocked').
+
+Tests: tests/gateway/test_discord_question_buttons.py (nep-interacties, geen
+netwerk; draait zonder async-pytest-plugin).
+---
+ plugins/platforms/discord/adapter.py          | 200 +++++++++
+ .../gateway/test_discord_question_buttons.py  | 392 ++++++++++++++++++
+ 2 files changed, 592 insertions(+)
+ create mode 100644 tests/gateway/test_discord_question_buttons.py
+
+diff --git a/plugins/platforms/discord/adapter.py b/plugins/platforms/discord/adapter.py
+index e0b91aafe8..ccc0c83533 100644
+--- a/plugins/platforms/discord/adapter.py
++++ b/plugins/platforms/discord/adapter.py
+@@ -1327,6 +1327,14 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
+             async def on_thread_update(before, after):
+                 await adapter_self._on_platform_thread_update(before, after)
+ 
++            @self._client.event
++            async def on_interaction(interaction):
++                # Owner-question buttons ("tq:<task>:<episode>:<n>") are posted over REST by an
++                # external question poster, so no discord.ui.View is registered for them; they and
++                # the "Anders…" text field ("tqm:<task>:<episode>") are handled here by custom_id,
++                # which survives gateway restarts. Every other interaction is left alone.
++                await adapter_self._dispatch_question_interaction(interaction)
++
+             @self._client.event
+             async def on_voice_state_update(member, before, after):
+                 """Track voice channel join/leave events."""
+@@ -4625,6 +4633,198 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
+             guild_id = getattr(guild, "id", None)
+         return str(guild_id) if guild_id else None
+ 
++    # --- Owner questions with answer buttons (forum posts) ---
++    #
++    # An external poster creates a forum post per open question with buttons whose custom_id is
++    # ``tq:<task_id>:<episode>:<n>`` (option n) or ``tq:<task_id>:<episode>:x`` ("Anders…": free
++    # text). ``<episode>`` is the id of the kanban ``blocked`` event that asked the question. Only
++    # the configured owner (``decision_owner_id``) may answer; the answer reaches the agent of that
++    # post as a normal message, e.g. "Antwoord van de eigenaar (knop): optie 2 — Variant B".
++    #
++    # Config (platforms.discord, stored in ``extra``):
++    #   decision_owner_id      Discord user id(s) allowed to answer (comma separated)
++    #   question_owner_label   name used in the texts (default "de eigenaar")
++    #   question_tags          {open, beantwoord, verwerkt}: forum tag names (defaults as shown)
++    #   question_board         kanban board checked for "still open" (default: current board)
++    #   question_texts         overrides for the user-facing texts below (same keys)
++
++    _QUESTION_TEXT_DEFAULTS: Dict[str, str] = {
++        "not_owner": "Alleen {label} kan deze vraag beantwoorden.",
++        "answer_button": "Antwoord van {label} (knop): optie {choice} — {option}",
++        "answer_other": "Antwoord van {label} (anders): {text}",
++        "already_answered": ("Deze vraag is al beantwoord of vervangen door een nieuwere vraag (zie de post). "
++                             "Wil je iets wijzigen, typ het dan in de post."),
++        "already_answered_modal": ("Deze vraag is intussen al beantwoord of vervangen. Je tekst is niet verstuurd; "
++                                   "wil je iets wijzigen, typ het dan in de post."),
++        "received": "✅ Ontvangen",
++        "failed": "⚠️ Lukt niet, typ je antwoord in de post.",
++        "empty": "Leeg antwoord; typ je antwoord in de post.",
++        "chosen": "✅ **Gekozen:** {option}",
++        "other_option": "Anders: {text}",
++        "modal_title": "Ander antwoord",
++        "modal_label": "Jouw antwoord of tegenvraag",
++    }
++    _QUESTION_TAG_DEFAULTS: Dict[str, str] = {"open": "open", "beantwoord": "beantwoord", "verwerkt": "verwerkt"}
++    _QUESTION_MESSAGE_BUDGET = 1900  # edited question message stays well below Discord's 2000 chars
++
++    def _question_text(self, key: str, **values: Any) -> str:
++        """User-facing question text: ``question_texts[key]`` from the config, else the default.
++        A broken override (unknown placeholder) falls back to the default."""
++        values.setdefault("label", self._question_owner_label())
++        overrides = self.config.extra.get("question_texts")
++        template = overrides.get(key) if isinstance(overrides, dict) else None
++        default = self._QUESTION_TEXT_DEFAULTS[key]
++        try:
++            return str(template if template else default).format(**values)
++        except (KeyError, IndexError, ValueError):
++            return default.format(**values)
++
++    def _question_owner_label(self) -> str:
++        return str(self.config.extra.get("question_owner_label") or "").strip() or "de eigenaar"
++
++    def _question_tag_names(self) -> Dict[str, str]:
++        configured = self.config.extra.get("question_tags")
++        names = dict(self._QUESTION_TAG_DEFAULTS)
++        if isinstance(configured, dict):
++            names.update({k: str(v).strip() for k, v in configured.items() if k in names and str(v or "").strip()})
++        return names
++
++    async def _dispatch_question_interaction(self, interaction: discord.Interaction) -> bool:
++        """Route owner-question components by custom_id; False when the interaction is not ours."""
++        data = getattr(interaction, "data", None) or {}
++        cid = str(data.get("custom_id", "") if isinstance(data, dict) else "")
++        if cid.startswith("tq:"):
++            await self._handle_question_button(interaction)
++            return True
++        if cid.startswith("tqm:"):
++            await self._handle_question_modal(interaction)
++            return True
++        return False
++
++    async def _handle_question_button(self, interaction: discord.Interaction) -> None:
++        """``tq:<task>:<episode>:<n>`` answers with option n; ``tq:<task>:<episode>:x`` ("Anders…")
++        opens a text field with custom_id ``tqm:<task>:<episode>`` whose submit is handled by id
++        (no in-memory state, so a field that was open during a gateway restart still works)."""
++        custom_id = str((interaction.data or {}).get("custom_id", ""))
++        parts = custom_id.split(":")
++        if len(parts) != 4 or not self._is_question_owner(interaction):
++            await interaction.response.send_message(self._question_text("not_owner"), ephemeral=True)
++            return
++        choice = parts[3]
++        if not self._question_still_open(parts[1], parts[2]):
++            await interaction.response.send_message(self._question_text("already_answered"), ephemeral=True)
++            return
++        if choice == "x":
++            modal = discord.ui.Modal(title=self._question_text("modal_title")[:45],
++                                     custom_id=f"tqm:{parts[1]}:{parts[2]}"[:100], timeout=None)
++            modal.add_item(discord.ui.TextInput(label=self._question_text("modal_label")[:45], custom_id="answer",
++                                                style=discord.TextStyle.paragraph, max_length=1500))
++            await interaction.response.send_modal(modal)
++            return
++        option = choice
++        for row in getattr(interaction.message, "components", None) or []:
++            for comp in getattr(row, "children", None) or []:
++                if getattr(comp, "custom_id", None) == custom_id:
++                    option = getattr(comp, "label", None) or choice
++        await self._finish_question(interaction, custom_id, option,
++                                    self._question_text("answer_button", choice=choice, option=option))
++
++    async def _handle_question_modal(self, interaction: discord.Interaction) -> None:
++        """Submitted "Anders…" field (``tqm:<task>:<episode>``): read the text from the payload itself."""
++        custom_id = str((interaction.data or {}).get("custom_id", ""))
++        if not self._is_question_owner(interaction):
++            await interaction.response.send_message(self._question_text("not_owner"), ephemeral=True)
++            return
++        text = ""
++        for row in (interaction.data or {}).get("components", []) or []:
++            for comp in row.get("components", []) or []:
++                if comp.get("custom_id") == "answer":
++                    text = str(comp.get("value") or "").strip()
++        if not text:
++            await interaction.response.send_message(self._question_text("empty"), ephemeral=True)
++            return
++        parts = custom_id.split(":")
++        if len(parts) == 3 and not self._question_still_open(parts[1], parts[2]):
++            await interaction.response.send_message(self._question_text("already_answered_modal"), ephemeral=True)
++            return
++        await self._finish_question(interaction, custom_id, self._question_text("other_option", text=text[:150]),
++                                    self._question_text("answer_other", text=text))
++
++    def _question_still_open(self, task_id: str, episode: str) -> bool:
++        """True while the card is still blocked on exactly this question (its latest real ``blocked``
++        event is the question's episode). A question answered elsewhere (typed in the post, another
++        client, the CLI, a wait-state update "Wacht op …") is closed, so a late click never adds a
++        second, conflicting answer. Unreadable board -> allow (fail open to the owner)."""
++        import sqlite3
++        try:
++            from hermes_cli import kanban_db as _kb
++            board = str(self.config.extra.get("question_board") or "").strip() or None
++            conn = sqlite3.connect(f"file:{_kb.kanban_db_path(board=board)}?mode=ro", uri=True, timeout=5)
++            try:
++                row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
++                if not row or row[0] != "blocked":
++                    return False
++                last = conn.execute("SELECT id, payload FROM task_events WHERE task_id = ? AND kind = 'blocked' "
++                                    "ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
++            finally:
++                conn.close()
++            if not last:
++                return False
++            try:
++                payload = json.loads(last[1]) if last[1] else {}
++            except (TypeError, ValueError):
++                payload = {}
++            if isinstance(payload, dict) and payload.get("status_update"):
++                return False  # answered and rewritten to a wait state ("Wacht op …")
++            return str(last[0]) == str(episode)
++        except Exception:
++            logger.warning("[Discord] question %s: board unreadable, accepting the answer", task_id, exc_info=True)
++            return True
++
++    def _is_question_owner(self, interaction: discord.Interaction) -> bool:
++        owners = {o.strip() for o in str(self.config.extra.get("decision_owner_id", "") or "").split(",") if o.strip()}
++        return bool(owners) and str(getattr(getattr(interaction, "user", None), "id", "")) in owners
++
++    async def _finish_question(self, interaction: discord.Interaction, custom_id: str, option: str, text: str) -> None:
++        """Acknowledge at once (defer, well within Discord's 3 s), then pass the answer to the agent and
++        confirm with "✅ Ontvangen"; only then remove the buttons and tag the post as answered. If passing
++        the answer fails, the owner is told to type it in the post."""
++        try:
++            await interaction.response.defer()
++        except Exception as e:
++            if not self._is_discord_unknown_interaction(e):
++                logger.warning("[Discord] question %s: defer failed", custom_id, exc_info=True)
++        try:
++            await self.handle_message(self._build_slash_event(interaction, text))
++        except Exception:
++            logger.error("[Discord] question %s: answer could not be passed on", custom_id, exc_info=True)
++            with suppress(Exception):
++                await interaction.followup.send(self._question_text("failed"), ephemeral=True)
++            return
++        with suppress(Exception):
++            await interaction.followup.send(self._question_text("received"), ephemeral=True)
++        message = getattr(interaction, "message", None)
++        if message is not None:
++            suffix = ("\n\n" + self._question_text("chosen", option=option[:150]))[: self._QUESTION_MESSAGE_BUDGET]
++            content = (getattr(message, "content", "") or "")[: self._QUESTION_MESSAGE_BUDGET - len(suffix)] + suffix
++            try:
++                await message.edit(content=content, view=None)
++            except Exception:
++                logger.warning("[Discord] question %s: could not update the question message", custom_id, exc_info=True)
++        thread = interaction.channel
++        forum = getattr(thread, "parent", None)
++        tags = getattr(forum, "available_tags", None) or []
++        names = self._question_tag_names()
++        answered = next((t for t in tags if t.name.lower() == names["beantwoord"].lower()), None)
++        if answered is not None and isinstance(thread, discord.Thread):
++            managed = {n.lower() for n in names.values()}
++            keep = [t for t in (thread.applied_tags or []) if t.name.lower() not in managed]
++            try:
++                await thread.edit(applied_tags=(keep + [answered])[:5])
++            except Exception:
++                logger.warning("[Discord] question %s: could not set tag '%s'", custom_id, names["beantwoord"],
++                               exc_info=True)
++
+     def _build_slash_event(self, interaction: discord.Interaction, text: str) -> MessageEvent:
+         """Build a MessageEvent from a Discord slash command interaction."""
+         is_dm = isinstance(interaction.channel, discord.DMChannel)
+diff --git a/tests/gateway/test_discord_question_buttons.py b/tests/gateway/test_discord_question_buttons.py
+new file mode 100644
+index 0000000000..3f57e3a325
+--- /dev/null
++++ b/tests/gateway/test_discord_question_buttons.py
+@@ -0,0 +1,392 @@
++"""Owner-question buttons in a Discord forum post (custom_id ``tq:<task>:<episode>:<n|x>``).
++
++The buttons are posted over REST by an external question poster, so the adapter handles
++them (and the "Anders…" text field ``tqm:<task>:<episode>``) by custom_id in
++``on_interaction``. These tests drive the handlers with fake interaction, message and
++thread objects: no network, no Discord client. They are plain sync tests that run the
++coroutines with ``asyncio.run`` so they need no async pytest plugin.
++"""
++
++from __future__ import annotations
++
++import asyncio
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import AsyncMock
++
++import pytest
++
++from gateway.config import PlatformConfig
++import plugins.platforms.discord.adapter as adapter_mod
++from plugins.platforms.discord.adapter import DiscordAdapter
++
++OWNER_ID = "1001"
++OTHER_ID = "2002"
++TASK = "t_0000abcd"
++EPISODE = "12"
++
++
++class FakeTag:
++    def __init__(self, name: str) -> None:
++        self.name = name
++
++    def __repr__(self) -> str:  # readable assertion output
++        return f"FakeTag({self.name!r})"
++
++
++class FakeThread:
++    """Stands in for ``discord.Thread`` (patched onto the adapter's ``discord`` module)."""
++
++    def __init__(self, tags, applied) -> None:
++        self.id = 555
++        self.name = "Vraag: A of B?"
++        self.guild = None
++        self.parent = SimpleNamespace(id=444, name="vragen", available_tags=tags, topic=None)
++        self.parent_id = 444
++        self.applied_tags = applied
++        self.edit = AsyncMock()
++
++
++class FakeModal:
++    def __init__(self, *, title=None, custom_id=None, timeout=None, **_):
++        self.title, self.custom_id, self.timeout, self.children = title, custom_id, timeout, []
++
++    def add_item(self, item):
++        self.children.append(item)
++
++
++class FakeTextInput:
++    def __init__(self, *, label=None, custom_id=None, style=None, max_length=None, **_):
++        self.label, self.custom_id, self.style, self.max_length = label, custom_id, style, max_length
++
++
++@pytest.fixture(autouse=True)
++def fake_discord_types(monkeypatch):
++    monkeypatch.setattr(adapter_mod.discord, "Thread", FakeThread)
++    if not hasattr(adapter_mod.discord.ui, "Modal"):  # mocked discord module (library not installed)
++        monkeypatch.setattr(adapter_mod.discord.ui, "Modal", FakeModal, raising=False)
++        monkeypatch.setattr(adapter_mod.discord.ui, "TextInput", FakeTextInput, raising=False)
++
++
++def _adapter(**extra) -> DiscordAdapter:
++    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***", extra={"decision_owner_id": OWNER_ID, **extra}))
++    adapter.handle_message = AsyncMock()
++    return adapter
++
++
++def _components(task, episode, *options):
++    children = [SimpleNamespace(custom_id=f"tq:{task}:{episode}:{n}", label=label) for n, label in options]
++    children.append(SimpleNamespace(custom_id=f"tq:{task}:{episode}:x", label="✏️ Anders…"))
++    return [SimpleNamespace(children=children)]
++
++
++def _interaction(custom_id: str, *, user_id: str = OWNER_ID, content: str = "**Vraag:** A of B?",
++                 options=((1, "Variant A"), (2, "Variant B")), data_extra=None, tags=None, applied=None):
++    tags = tags if tags is not None else [FakeTag("open"), FakeTag("beantwoord"), FakeTag("verwerkt"), FakeTag("bug")]
++    applied = applied if applied is not None else [tags[0], tags[3]]
++    thread = FakeThread(tags, applied)
++    parts = custom_id.split(":")
++    task, episode = (parts[1], parts[2]) if len(parts) >= 3 else (TASK, EPISODE)
++    message = SimpleNamespace(content=content, components=_components(task, episode, *options), edit=AsyncMock())
++    return SimpleNamespace(
++        data={"custom_id": custom_id, **(data_extra or {})},
++        user=SimpleNamespace(id=int(user_id), display_name="someone"),
++        response=SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock(), send_modal=AsyncMock()),
++        followup=SimpleNamespace(send=AsyncMock()),
++        message=message, channel=thread, channel_id=thread.id, guild_id=None,
++    )
++
++
++def _modal_submit(text: str, *, user_id: str = OWNER_ID, episode: str = EPISODE):
++    return _interaction(f"tqm:{TASK}:{episode}", user_id=user_id, data_extra={"components": [
++        {"type": 1, "components": [{"type": 4, "custom_id": "answer", "value": text}]}]})
++
++
++def _run(adapter, interaction) -> bool:
++    return asyncio.run(adapter._dispatch_question_interaction(interaction))
++
++
++def _sent_text(adapter) -> str:
++    adapter.handle_message.assert_awaited_once()
++    return adapter.handle_message.await_args.args[0].text
++
++
++def _ephemeral(interaction) -> str:
++    interaction.response.send_message.assert_awaited_once()
++    assert interaction.response.send_message.await_args.kwargs.get("ephemeral") is True
++    return interaction.response.send_message.await_args.args[0]
++
++
++# (a) owner clicks an option -------------------------------------------------------------------
++
++def test_owner_click_is_acknowledged_passed_on_and_tagged(monkeypatch):
++    adapter = _adapter()
++    monkeypatch.setattr(adapter, "_question_still_open", lambda task, ep: (task, ep) == (TASK, EPISODE))
++    interaction = _interaction(f"tq:{TASK}:{EPISODE}:2")
++
++    assert _run(adapter, interaction) is True
++
++    interaction.response.defer.assert_awaited_once()
++    event = adapter.handle_message.await_args.args[0]
++    assert _sent_text(adapter) == "Antwoord van de eigenaar (knop): optie 2 — Variant B"
++    assert event.source.thread_id == str(interaction.channel.id)
++    interaction.followup.send.assert_awaited_once_with("✅ Ontvangen", ephemeral=True)
++    edit = interaction.message.edit.await_args.kwargs
++    assert edit["view"] is None
++    assert edit["content"] == "**Vraag:** A of B?\n\n✅ **Gekozen:** Variant B"
++    applied = interaction.channel.edit.await_args.kwargs["applied_tags"]
++    assert [t.name for t in applied] == ["bug", "beantwoord"]
++    interaction.response.send_message.assert_not_awaited()
++
++
++def test_failed_hand_off_tells_the_owner_and_keeps_the_buttons(monkeypatch):
++    adapter = _adapter()
++    adapter.handle_message = AsyncMock(side_effect=RuntimeError("boom"))
++    monkeypatch.setattr(adapter, "_question_still_open", lambda *_: True)
++    interaction = _interaction(f"tq:{TASK}:{EPISODE}:1")
++
++    _run(adapter, interaction)
++
++    interaction.followup.send.assert_awaited_once_with("⚠️ Lukt niet, typ je antwoord in de post.", ephemeral=True)
++    interaction.message.edit.assert_not_awaited()
++    interaction.channel.edit.assert_not_awaited()
++
++
++# (b) someone else clicks ---------------------------------------------------------------------
++
++@pytest.mark.parametrize("extra", [{}, {"decision_owner_id": ""}])
++def test_click_by_someone_else_is_refused(monkeypatch, extra):
++    adapter = _adapter(**extra)
++    monkeypatch.setattr(adapter, "_question_still_open", lambda *_: True)
++    interaction = _interaction(f"tq:{TASK}:{EPISODE}:1", user_id=OTHER_ID)
++
++    _run(adapter, interaction)
++
++    assert _ephemeral(interaction) == "Alleen de eigenaar kan deze vraag beantwoorden."
++    adapter.handle_message.assert_not_awaited()
++    interaction.message.edit.assert_not_awaited()
++    interaction.channel.edit.assert_not_awaited()
++
++
++def test_modal_submit_by_someone_else_is_refused(monkeypatch):
++    adapter = _adapter()
++    monkeypatch.setattr(adapter, "_question_still_open", lambda *_: True)
++    interaction = _modal_submit("ik ook", user_id=OTHER_ID)
++
++    _run(adapter, interaction)
++
++    assert _ephemeral(interaction) == "Alleen de eigenaar kan deze vraag beantwoorden."
++    adapter.handle_message.assert_not_awaited()
++
++
++def test_other_interactions_are_left_alone():
++    adapter = _adapter()
++    interaction = _interaction("approval:abc:once")
++    assert _run(adapter, interaction) is False
++    interaction.response.send_message.assert_not_awaited()
++    interaction.response.defer.assert_not_awaited()
++    adapter.handle_message.assert_not_awaited()
++
++
++# (c) "Anders…" opens a text field; its submit is handled by custom_id -------------------------
++
++def test_other_button_opens_a_restart_safe_modal(monkeypatch):
++    adapter = _adapter()
++    monkeypatch.setattr(adapter, "_question_still_open", lambda *_: True)
++    interaction = _interaction(f"tq:{TASK}:{EPISODE}:x")
++
++    _run(adapter, interaction)
++
++    interaction.response.send_modal.assert_awaited_once()
++    modal = interaction.response.send_modal.await_args.args[0]
++    assert modal.custom_id == f"tqm:{TASK}:{EPISODE}"
++    assert modal.timeout is None
++    field = modal.children[0]
++    assert field.custom_id == "answer"
++    adapter.handle_message.assert_not_awaited()
++
++
++def test_modal_submit_passes_the_free_text_on(monkeypatch):
++    adapter = _adapter()
++    monkeypatch.setattr(adapter, "_question_still_open", lambda *_: True)
++    interaction = _modal_submit("  Liever C, want sneller.  ")
++
++    _run(adapter, interaction)
++
++    interaction.response.defer.assert_awaited_once()
++    assert _sent_text(adapter) == "Antwoord van de eigenaar (anders): Liever C, want sneller."
++    assert interaction.message.edit.await_args.kwargs["content"].endswith(
++        "✅ **Gekozen:** Anders: Liever C, want sneller.")
++
++
++def test_empty_modal_submit_is_refused(monkeypatch):
++    adapter = _adapter()
++    monkeypatch.setattr(adapter, "_question_still_open", lambda *_: True)
++    interaction = _modal_submit("   ")
++    _run(adapter, interaction)
++    assert _ephemeral(interaction) == "Leeg antwoord; typ je antwoord in de post."
++    adapter.handle_message.assert_not_awaited()
++
++
++# (d) the card no longer waits on this question --------------------------------------------------
++
++@pytest.fixture
++def board(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
++    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    kb.init_db()
++
++    def ask(question: str = "Vraag voor de eigenaar: A of B?"):
++        with kbc.connect_closing() as conn:
++            tid = kb.create_task(conn, title="t", assignee="worker")
++            with kb.write_txn(conn):
++                conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
++            assert kb.claim_task(conn, tid, claimer="worker") is not None
++            assert kb.block_task(conn, tid, reason=question, kind="needs_input")
++            episode = conn.execute("SELECT MAX(id) FROM task_events WHERE task_id = ? AND kind = 'blocked'",
++                                   (tid,)).fetchone()[0]
++        return tid, str(episode)
++
++    def block(tid: str, reason: str) -> None:
++        with kbc.connect_closing() as conn:
++            assert kb.block_task(conn, tid, reason=reason)
++
++    def unblock(tid: str) -> None:
++        with kbc.connect_closing() as conn:
++            assert kb.unblock_task(conn, tid)
++
++    return SimpleNamespace(ask=ask, block=block, unblock=unblock)
++
++
++def _click(adapter, tid: str, episode: str, choice: str = "1"):
++    interaction = _interaction(f"tq:{tid}:{episode}:{choice}")
++    _run(adapter, interaction)
++    return interaction
++
++
++def test_board_check_accepts_the_open_question(board):
++    tid, episode = board.ask()
++    adapter = _adapter()
++    assert adapter._question_still_open(tid, episode)
++    _click(adapter, tid, episode)
++    assert _sent_text(adapter) == "Antwoord van de eigenaar (knop): optie 1 — Variant A"
++
++
++def test_click_after_an_answer_elsewhere_is_refused(board):
++    tid, episode = board.ask()
++    board.unblock(tid)  # answered in the post / another client / the CLI
++    adapter = _adapter()
++    interaction = _click(adapter, tid, episode)
++    assert _ephemeral(interaction).startswith("Deze vraag is al beantwoord of vervangen door een nieuwere vraag")
++    adapter.handle_message.assert_not_awaited()
++    interaction.response.defer.assert_not_awaited()
++    interaction.message.edit.assert_not_awaited()
++
++
++def test_click_after_a_wait_state_update_is_refused(board):
++    tid, episode = board.ask()
++    board.block(tid, "Wacht op nachtrun – antwoord A gegeven")
++    adapter = _adapter()
++    interaction = _click(adapter, tid, episode)
++    assert _ephemeral(interaction).startswith("Deze vraag is al beantwoord")
++    adapter.handle_message.assert_not_awaited()
++
++
++def test_click_on_a_superseded_question_is_refused(board):
++    tid, episode = board.ask()
++    adapter = _adapter()
++    interaction = _click(adapter, tid, str(int(episode) - 1))  # an older question of this card
++    assert _ephemeral(interaction).startswith("Deze vraag is al beantwoord")
++    adapter.handle_message.assert_not_awaited()
++
++
++def test_modal_submit_after_an_answer_elsewhere_is_refused(board):
++    tid, episode = board.ask()
++    board.unblock(tid)
++    adapter = _adapter()
++    interaction = _interaction(f"tqm:{tid}:{episode}", data_extra={"components": [
++        {"type": 1, "components": [{"type": 4, "custom_id": "answer", "value": "C"}]}]})
++    _run(adapter, interaction)
++    assert _ephemeral(interaction).startswith("Deze vraag is intussen al beantwoord of vervangen")
++    adapter.handle_message.assert_not_awaited()
++
++
++def test_unknown_card_is_refused(board):
++    adapter = _adapter()
++    interaction = _click(adapter, "t_ffffffff", "1")
++    assert _ephemeral(interaction).startswith("Deze vraag is al beantwoord")
++    adapter.handle_message.assert_not_awaited()
++
++
++# (e) the edited question message never exceeds Discord's 2000 characters -----------------------
++
++@pytest.mark.parametrize("content_len,option_len", [(0, 10), (1999, 10), (5000, 300), (1890, 150)])
++def test_edited_message_stays_below_2000_chars(monkeypatch, content_len, option_len):
++    adapter = _adapter()
++    monkeypatch.setattr(adapter, "_question_still_open", lambda *_: True)
++    interaction = _interaction(f"tq:{TASK}:{EPISODE}:1", content="v" * content_len,
++                               options=((1, "o" * option_len), (2, "B")))
++    _run(adapter, interaction)
++    content = interaction.message.edit.await_args.kwargs["content"]
++    assert len(content) <= 2000
++    assert "✅ **Gekozen:** " in content
++
++
++def test_long_free_text_and_long_chosen_template_stay_below_2000_chars(monkeypatch):
++    adapter = _adapter(question_texts={"chosen": "✅ " + "x" * 2500 + " {option}"})
++    monkeypatch.setattr(adapter, "_question_still_open", lambda *_: True)
++    interaction = _modal_submit("w" * 1500)
++    interaction.message.content = "v" * 1999
++    _run(adapter, interaction)
++    assert len(interaction.message.edit.await_args.kwargs["content"]) <= 2000
++
++
++# (f) configuration: owner label, tags, texts -----------------------------------------------------
++
++def test_owner_label_is_configurable(monkeypatch):
++    adapter = _adapter(question_owner_label="Sam")
++    monkeypatch.setattr(adapter, "_question_still_open", lambda *_: True)
++
++    _run(adapter, _interaction(f"tq:{TASK}:{EPISODE}:1"))
++    assert _sent_text(adapter) == "Antwoord van Sam (knop): optie 1 — Variant A"
++
++    adapter.handle_message.reset_mock()
++    _run(adapter, _modal_submit("C"))
++    assert _sent_text(adapter) == "Antwoord van Sam (anders): C"
++
++    refused = _interaction(f"tq:{TASK}:{EPISODE}:1", user_id=OTHER_ID)
++    _run(adapter, refused)
++    assert _ephemeral(refused) == "Alleen Sam kan deze vraag beantwoorden."
++
++
++def test_tag_names_are_configurable(monkeypatch):
++    adapter = _adapter(question_tags={"open": "Open", "beantwoord": "Answered", "verwerkt": "Done"})
++    monkeypatch.setattr(adapter, "_question_still_open", lambda *_: True)
++    tags = [FakeTag("Open"), FakeTag("Answered"), FakeTag("Done"), FakeTag("beantwoord")]
++    interaction = _interaction(f"tq:{TASK}:{EPISODE}:1", tags=tags, applied=[tags[0], tags[3]])
++    _run(adapter, interaction)
++    applied = interaction.channel.edit.await_args.kwargs["applied_tags"]
++    assert [t.name for t in applied] == ["beantwoord", "Answered"]
++
++
++def test_texts_are_overridable_and_broken_overrides_fall_back(monkeypatch):
++    adapter = _adapter(question_texts={"received": "Got it", "answer_button": "Answer {choice}: {option} ({nope})"})
++    monkeypatch.setattr(adapter, "_question_still_open", lambda *_: True)
++    interaction = _interaction(f"tq:{TASK}:{EPISODE}:2")
++    _run(adapter, interaction)
++    interaction.followup.send.assert_awaited_once_with("Got it", ephemeral=True)
++    assert _sent_text(adapter) == "Antwoord van de eigenaar (knop): optie 2 — Variant B"
++
++
++def test_several_owner_ids_may_answer(monkeypatch):
++    adapter = _adapter(decision_owner_id=f"{OTHER_ID}, {OWNER_ID}")
++    monkeypatch.setattr(adapter, "_question_still_open", lambda *_: True)
++    _run(adapter, _interaction(f"tq:{TASK}:{EPISODE}:1"))
++    adapter.handle_message.assert_awaited_once()

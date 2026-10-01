@@ -1,0 +1,335 @@
+# Hermes Discord Flow — voorbeeldconfig
+#
+# Kopieer dit bestand naar ~/.hermes/team/flow.yaml (install.sh doet dat als het er nog niet is) en vul je eigen
+# waarden in. Dat bestand blijft lokaal: zet het nooit in git (staat in .gitignore). Rechten: chmod 600.
+# Een andere plek kan met de omgevingsvariabele HERMES_FLOW_CONFIG=/pad/naar/flow.yaml.
+#
+# Je hoeft niet alles over te nemen: wat je weglaat, krijgt de waarde uit dit voorbeeld (de scripts kennen die).
+# Waarden als "<GUILD_ID>" zijn plaatshouders en tellen als "leeg".
+# Controleren: python3 ~/.hermes/scripts/flow_config.py check
+#
+# In teksten mag je deze plaatshouders gebruiken (tussen accolades): {eigenaar} overal, plus wat er per tekst bij
+# staat. Een letterlijke accolade schrijf je dubbel: {{ of }}.
+
+versie: 1
+
+eigenaar:
+  # Hoe de scripts de eigenaar noemen (degene die de vragen beantwoordt), midden in een zin.
+  # Bijvoorbeeld "Sanne" of "de eigenaar".
+  naam: de eigenaar
+
+# Tijdzone voor alle tijden in berichten en rapporten (IANA-naam).
+tijdzone: Europe/Amsterdam
+
+paden:
+  # ~ = je thuismap. Een relatief pad (zonder ~ of /) ligt onder HERMES_HOME (meestal ~/.hermes).
+  hermes_bin: ~/.local/bin/hermes          # het hermes-commando
+  hermes_python: python3                   # Python waarmee Hermes zelf draait (chatlog-rotate.py importeert Hermes)
+  projecten_map: ~/Hermes Workspace/projects   # map met je projectrepo's (voor de werkmappen-opruiming)
+  archief_root: "~"                        # hieronder komt hermes-archief-<datum>/ bij het opruimen
+  workflow_inbox: workflow-inbox           # map voor workflowpunten van de manager (zie docs/manager-instructies.md)
+  incidentenlog: ""                        # optioneel: markdown-tabel met incidenten voor het weekoverzicht op maandag
+  discord_ids: team/discord.json           # hier schrijft discord_setup.py de kanaal-ID's
+  workflow_modus: team/workflow-modus.json # optioneel: {"modus": "opstart" | "rapport", ...}
+  workflow_waits: team/workflow-waits.json # optioneel: kaarten die op een systemd-run wachten
+  overdracht_chatlog: team/overdracht-chatlog.md   # overdracht bij het nachtelijk vernieuwen van #chatlog
+
+bord:
+  naam: team        # het Hermes-kanbanbord van het team (hermes kanban --board <naam>)
+
+rollen:
+  # Hermes-profielnamen van de rollen.
+  manager: default
+  bouwer: coder
+  controleurs: [reviewer, security, designer]   # rollen die controleren (review, beveiliging, ontwerp)
+  max_per_rol: {coder: 2}                        # zoals de dispatcher: maximaal zoveel tegelijk per rol (anders 1)
+  max_totaal: 3                                  # kanban.max_in_progress
+
+gateway:
+  unit: hermes-gateway.service   # systemd --user unit van de Hermes-gateway
+
+discord:
+  # Rechtsklik in Discord (ontwikkelaarsmodus aan) → "ID kopiëren".
+  guild_id: "<GUILD_ID>"   # de Discord-server
+  owner_id: "<OWNER_ID>"   # jouw gebruikers-ID: alleen jij krijgt pings en alleen jouw knopklik telt
+  community: true          # Community aanzetten (nodig voor een forumkanaal); false = zelf al gedaan
+  categorieen:
+    # sleutel: naam van de categorie in Discord. De volgorde hier is de volgorde in Discord.
+    algemeen: GENERAL
+    team: HERMES AGENTS
+    workflow: WORKFLOW
+    systeem: Systeem
+  kanalen:
+    # Per kanaal: naam (in Discord), categorie (sleutel van hierboven), soort (tekst of forum),
+    # id (leeg = discord_setup.py zoekt of maakt hem en schrijft het ID in discord_ids),
+    # alleen_bot (true = alleen de bot post; in een forum start alleen de bot een post, iedereen mag erin reageren),
+    # onderwerp (de kanaalomschrijving; {eigenaar} mag).
+    # De sleutels (chatlog, vragen, …) gebruiken de scripts; die verander je niet. Basis: vragen, meldingen,
+    # staging, samenvatting (en chatlog voor de gesprekken). Extra: ochtendrapport, gezondheid, releases.
+    chatlog:
+      naam: chatlog
+      categorie: algemeen
+      soort: tekst
+      id: ""
+      alleen_bot: false
+      onderwerp: Gesprekken met de manager.
+    vragen:
+      naam: vragen
+      categorie: team
+      soort: forum
+      id: ""
+      alleen_bot: true
+      onderwerp: "Vragen van het team aan {eigenaar}: één post per vraag. Klik een optie of typ je antwoord."
+    meldingen:
+      naam: meldingen
+      categorie: team
+      soort: tekst
+      id: ""
+      alleen_bot: true
+      onderwerp: "Alleen projectwerk: vastgelopen of mislukte kaarten, beslissing manager, blok/fase compleet, en storingen die het projectwerk stilleggen."
+    staging:
+      naam: staging
+      categorie: team
+      soort: tekst
+      id: ""
+      alleen_bot: true
+      onderwerp: Eén regel per kaart die op staging staat.
+    samenvatting:
+      naam: samenvatting
+      categorie: team
+      soort: tekst
+      id: ""
+      alleen_bot: true
+      onderwerp: Dagelijkse samenvatting (08:00).
+    ochtendrapport:
+      naam: ochtendrapport
+      categorie: workflow
+      soort: tekst
+      id: ""
+      alleen_bot: true
+      onderwerp: Ochtendrapport van de workflow (en maandag het weekoverzicht van de incidenten). Eén ping per dag.
+    gezondheid:
+      naam: gezondheid
+      categorie: workflow
+      soort: tekst
+      id: ""
+      alleen_bot: true
+      onderwerp: "Gezondheidsmeldingen die het projectwerk niet stilleggen; worden '✅ opgelost'. Stil."
+    releases:
+      naam: releases
+      categorie: workflow
+      soort: tekst
+      id: ""
+      alleen_bot: true
+      onderwerp: Eén regel per workflow-release (releasenummer en wat er veranderde). Stil.
+    regels:
+      naam: regels
+      categorie: systeem
+      soort: tekst
+      id: ""
+      alleen_bot: false
+      onderwerp: Serverregels (nodig voor Community).
+    moderator-updates:
+      naam: moderator-updates
+      categorie: systeem
+      soort: tekst
+      id: ""
+      alleen_bot: false
+      onderwerp: Berichten van Discord aan beheerders (nodig voor Community).
+  tags:
+    # Labels in het forum #vragen per status. Zet dezelfde namen in de Hermes-config
+    # (discord → question_tags), anders zet de knop het verkeerde label.
+    open: open
+    beantwoord: beantwoord
+    verwerkt: verwerkt
+
+vragen:
+  # Begin van elke vraag op een kaart (needs_input). Vorm: "Vraag voor <wie>:" (de fork-patches herkennen dat).
+  prefix: "Vraag voor de eigenaar:"
+  # Projecten met deze STATUS (regel "STATUS: …" in team/projects/<slug>.md) krijgen posts in #vragen.
+  statussen: [ACTIEF, GEPAUZEERD]
+
+projecten:
+  # Per project (slug = bestandsnaam in ~/.hermes/team/projects/ en de Hermes-projectslug):
+  #   naam            weergavenaam
+  #   repo            map van de git-repo (voor git- en staging-controles als projects.db geen map kent)
+  #   staging_url     leeg = uit het projectbestand (regel "- Staging: … (branch `staging`) … URL https://…")
+  #   staging_branch  branch die op staging staat
+  #   health_pad      pad dat op staging HTTP 200 moet geven (gezondheidscheck)
+  #   verify          commando voor de volledige nachtcontrole in een schone kopie van staging (leeg = niet)
+  #   db              null = geen databasecheck; of {bestand: <pad in de repo met de standaard postgres-URL>}
+  - slug: voorbeeld-project
+    naam: Voorbeeldproject
+    repo: ~/Hermes Workspace/projects/voorbeeld-project
+    staging_url: ""
+    staging_branch: staging
+    health_pad: /health
+    verify: ""
+    db: null
+
+modus:
+  # opstart = de workflowkant mag kleine, terug te draaien fixes zelf doen; rapport = alleen melden.
+  # Geldt als paden.workflow_modus niet bestaat. Het ochtendrapport toont de modus.
+  standaard: opstart
+
+tijden:
+  # Hermes-cron (cron-notatie of "every 30m"); install.sh maakt de jobs hiermee.
+  vragen: "*/2 * * * *"
+  staging: "*/2 * * * *"
+  vastgelopen: "*/5 * * * *"
+  opruimcontrole: "*/10 * * * *"
+  bordbewaking: "*/30 * * * *"
+  werkmappen_opruimen: "15 */4 * * *"
+  schijfruimte: every 30m
+  samenvatting: "0 8 * * *"
+  # systemd-timers (in de tijdzone hierboven); install.sh schrijft ze in de units.
+  ochtendrapport: "07:30"
+  gezondheid: "*:07,37"        # OnCalendar-vorm: minuut 7 en 37 van elk uur
+  nachtcontrole: "02:30"
+  chatlog_rotatie: "04,05,06:00"
+
+drempels:
+  schijf_min_gb: 10                 # minder vrij op / = melding
+  cpu_max_procent: 60               # CPU-druk (some avg300)
+  swap_max_gb: 2.5
+  geheugen_min_mb: 400
+  checkin_max_uur: 2                # alleen als gezondheid.ops_checkin aan staat
+  werkmappen_resten_max: 10         # meer werkmappen van afgeronde kaarten = melding
+  werkmappen_totaal_max_gb: 12      # werkmappen samen groter = melding
+  werkmap_gesloten_na_uur: 6        # zo lang na done/archived mag een werkmap weg
+  review_prioriteit: 10             # review- en eindcontrolekaarten krijgen deze prioriteit (voor nieuwe bouwkaarten)
+  review_wacht_min: 15              # … als ze langer dan dit wachten
+  escalatie_uur: 6                  # bordbewaking: staat een afwijking er zo lang na het wekken nog, dan één melding
+  manager_escalatie_uur: 2          # … bij een blokkade die op de manager wacht
+  manager_opnieuw_wekken_min: 60
+  beslissing_manager_wacht_min: 30
+  vraag_zonder_post_min: 15
+  ready_zonder_eigenaar_min: 30
+  te_lang_running_uur: 3
+  vastgelopen_uur: 6                # onbekende blokkade langer dan dit = "Vastgelopen" in #meldingen
+  triage_min: 60
+  todo_min: 30
+  ready_uur: 2
+  kleurplaat_max_regels: 300        # standaardmaximum als de kleurplaat geen "Maximale grootte" noemt
+  gateway_plat_na_s: 120
+
+bordbewaking:
+  # Model-overrides die op een kaart mogen staan (bijvoorbeeld je escalatiemodel); elke andere = afwijking.
+  toegestane_model_override: []
+  verplichte_kleurplaat_secties: [Voorwaarden, Randgevallen]
+  # Unix-tijd vanaf wanneer een regel geldt (oudere kaarten worden niet gecontroleerd). 0 = altijd.
+  regels_sinds:
+    vervolg: 0
+    kleurplaat_secties: 0
+    afhankelijkheden: 0
+
+gezondheid:
+  model_login:
+    wrapper: ""          # optioneel: login-wrapper (pad onder HERMES_HOME) die uitvoerbaar moet zijn
+    env_variabele: ""    # optioneel: naam van een variabele in .env die naar een uitvoerbaar bestand wijst
+  postgres_log: ""       # optioneel: pad van het PostgreSQL-log (inlogfouten en rolwijzigingen)
+  ops_checkin: false     # true = controleer dat de workflowkant elk uur state/ops-checkin.json schrijft
+  werkmappen: true       # groeicontrole van de werkmappen
+
+opruimen:
+  overslaan_repos: []    # repo's waarvan de .worktrees nooit worden opgeruimd
+  overslaan_namen: []    # werkmapnamen die altijd blijven
+
+release:
+  # Commando's als lijst; {python} = deze Python, {scripts} = de scriptmap, {nr} en {notitie} = de release.
+  controle_commando: ["{python}", "{scripts}/flow-controle.py", "--quick"]   # rood = geen release
+  sync_commando: []      # optioneel, bijvoorbeeld je eigen repo-sync; leeg = overslaan
+
+export:
+  # Alleen voor wie zelf exporteert (scan_personal.py): extra termen die nooit in een export mogen
+  # (namen, projecten, domeinen; hoofdletterongevoelig), en toegestane uitzonderingen ("pad:tekst").
+  prive_termen: []
+  allowlist: []
+
+teksten:
+  # Alle vaste teksten van de berichten. Plaatshouders per tekst staan erbij.
+  opgelost: "✅ opgelost ({tijd}) — ~~{tekst}~~"   # {tijd}, {tekst}: zo wordt een opgeloste melding aangepast
+  vraag:
+    knop_anders: "✏️ Anders…"                      # knop die een invulveld opent
+    voetregel: "_Een aanbeveling is alleen advies: er gebeurt niets tot je klikt. Klik een optie of typ je antwoord._"
+    waarom_kop: "💡 **Waarom deze aanbeveling:**"
+    details_kop: "**Details**"
+    vervangen: "⚠️ Vervangen door de nieuwe vraag hieronder."
+    beantwoord_in_post: "✅ Beantwoord in de post."
+    beantwoord_buiten: "✅ Beantwoord buiten Discord (desktop of op de kaart)."
+    advies_gewijzigd: "⚠️ **Advies gewijzigd** — zie het nieuwe bericht hieronder."
+    nieuw_advies: "🔁 **Nieuw advies van het team**"
+  staging:
+    regel: "[{project}] ✅ {id} {titel} — {url}"                                  # {project} {id} {titel} {url}
+    samenvatting: "✅ Staging klaar (samenvatting, {aantal} kaarten) — {urls}"   # eerste run: {aantal} {urls}
+    compleet: "🏁 [{project}] {niveau} {code} compleet op staging (eindcontrole {eind} klaar)"   # {niveau} Fase/Blok
+  vastgelopen:
+    vastgelopen: Vastgelopen
+    beslissing_manager: Beslissing manager nodig
+    mislukt: "❌ Kaart mislukt: {id} {titel} ({project}) — {waarom}"
+    bouwer_onbeschikbaar: "⏸️ Bouwer niet beschikbaar: {aantal} kaart(en) wachten ({kaarten}). Er wordt geen ander model ingezet; ze gaan verder zodra de bouwer weer werkt."
+  bordbewaking:
+    escalatie: "🧭 Bordbewaking: {id} {titel} ({project}) — {waarom}. De manager kreeg dit {uren} uur geleden en het staat er nog."
+    escalatie_manager: "🧭 Kaart {id} {titel} ({project}) wacht al {uren} uur op een beslissing van de manager en ligt stil.\n1. Open #chatlog: {link}\n2. Typ: `Pak eerst de blokkade van {id} op, vóór je planwerk.`\n3. Daarna hoort de manager te antwoorden wat hij besluit, en staat de kaart niet meer op geblokkeerd.\nAntwoord hier alleen met \"gelukt\" of \"niet gelukt\"."
+  gezondheid:
+    blokkerend: "🔴 {label} faalt sinds {sinds}: {detail}. Projectwerk ligt stil."   # naar #meldingen (ping)
+    melding: "⚠️ {label}: {detail} (sinds {sinds})"                                   # naar #gezondheid (stil)
+  gateway:
+    onverwacht: "⚠️ Gateway onverwacht herstart: {waarom}. Weer online sinds {sinds}."
+    weer_online: "🟢 Gateway weer online (sinds {sinds})."
+    plat: "🔴 Gateway ligt plat sinds {sinds} (status {status}). Hermes reageert niet."
+  # {host} {vrij} {totaal} {procent} {drempel} (getallen; :.1f is de opmaak)
+  schijf: "⚠️ Weinig schijfruimte op {host}: nog {vrij:.1f} GB vrij van {totaal:.0f} GB ({procent:.0f}% in gebruik) — drempel is {drempel:.0f} GB. Maak ruimte vrij of breid de disk uit."
+  drain:
+    # drain-restart.py in #gezondheid ({sinds} {tot} {reden}) en de regel bovenaan team-status.py ({sinds} {tot})
+    actief: "⏸️ Drain actief sinds {sinds}, tot uiterlijk {tot} (geplande gateway-herstart): er starten even geen nieuwe kaarten; lopend werk gaat door. Geen storing."
+    klaar: "▶️ Drain klaar ({reden}): de dispatcher pakt weer kaarten op."
+    status_regel: "⏸️ DRAIN ACTIEF sinds {sinds}, tot uiterlijk {tot}: geplande herstart door de workflowkant. Er starten even geen nieuwe kaarten; lopend werk gaat door. Dit is GEEN storing: niet melden."
+  drain_vangnet: "⚠️ Vangnet drain: de dispatcher stond sinds {sinds} op pauze voor een geplande herstart, en is nu automatisch weer aangezet. Kaarten worden weer opgepakt. Je hoeft niets te doen; de workflowkant kijkt waarom de herstart niet afrondde."
+  release: "🚀 {nr} — {notitie} (regressie {score} OK)"
+  ochtendrapport:
+    kop: "**Ochtendrapport workflow {datum}** (modus: {modus})"
+    koppen:
+      gezondheid: "**Gezondheid**"
+      nacht: "**Nacht**"
+      opgelost: "**Uitgevoerd / zelf opgelost**"
+      inbox: "**Open workflowpunten**"
+      week: "**Week (incidentenlogboek)**"
+    modusvraag: "❓ Beslissing in de ops-sessie: op {tot} overschakelen naar rapportmodus, of de opstartmodus verlengen?"
+    voorstellen:
+      # In rapportmodus: het voorgestelde herstel per falende controle.
+      model-login: login-wrapper en .env-verwijzingen herstellen; daarna een testbeurt per model
+      db-login: rol en wachtwoord uit de projectcode terugzetten (niet door agents); login testen, geblokkeerde kaarten deblokkeren
+      pg-log: nagaan welke sessie de rol wijzigde; herstellen zoals bij db-login
+      git: GitHub-login (gh auth) of netwerk controleren
+      staging: de deploy en de laatste merge naar staging bekijken
+      gateway: gateway via het drain-script herstarten
+      dispatcher: drain afbreken (`drain-restart.py --restore`) en controleren of er kaarten worden opgepakt
+      worker-restanten: de verweesde worker-scopes stoppen
+      resources: "zware runs spreiden of het aantal workers verlagen; bij schijf: archief opruimen"
+      ops-checkin: de ops-sessie opnieuw starten en de uurlijkse zelfcontrole aanmaken
+  # Beslissingskaart als een fase compleet is: {prefix} {code} {project} {eind} {url} {branch} {commit}
+  productievraag: |-
+    {prefix}
+    Wat speelt er: Fase {code} van {project} is compleet: alle kaarten zijn klaar, de eindcontrole {eind} is afgerond en alles staat op staging ({url}, branch {branch} @ {commit}).
+    Vraag: Fase {code} naar productie?
+    Optie 1 ⭐ Aanbevolen: Ja, fase {code} naar productie
+      Inhoud: de manager merget precies commit {commit} van {branch} naar main en controleert productie daarna live.
+      Voordeel: gebruikers krijgen de afgeronde fase meteen.
+      Nadeel: wat op staging niet getest is, kan in productie toch anders werken.
+      Daarna: de manager zet de release in gang en meldt het resultaat; bij een probleem wordt het teruggedraaid.
+    Optie 2: Eerst zelf op staging bekijken
+      Inhoud: je bekijkt de fase eerst zelf op {url}; daarna vraagt de manager opnieuw.
+      Voordeel: je ziet het eerst met eigen ogen.
+      Nadeel: de release schuift op tot je hebt gekeken.
+      Daarna: de manager stelt dezelfde vraag opnieuw zodra jij zegt dat je hebt gekeken.
+    Optie 3: Nog niet, wachten tot de volgende fase
+      Inhoud: productie blijft zoals hij is; de volgende fase gaat later samen mee.
+      Voordeel: minder releases.
+      Nadeel: afgerond werk blijft langer liggen.
+      Daarna: de kaart wordt afgerond; bij de volgende complete fase komt een nieuwe vraag.
+    Waarom deze aanbeveling: 1) elke kaart is gereviewd en de eindcontrole is klaar; 2) staging draait precies deze commit. Kies liever optie 2 als je iets in deze fase zelf wilt zien, of als er gevoelige onderdelen in zitten (betalingen, accounts, gezondheidsdata).
+    Zonder antwoord: productie blijft zoals hij is; het werk aan de volgende fase gaat gewoon door.
+    Details: eindcontrole {eind}; staging {url}; commit {commit}. Productie alleen na jouw klik, voor precies die commit.
+  # Opdracht voor de manager bij de dagelijkse samenvatting (Hermes-cron met daily-summary-data.py).
+  samenvatting_prompt: "Hierboven staan de Kanban-gegevens van de projecten met STATUS: ACTIEF en de meting per bouwkaart. Gebruik uitsluitend die gegevens en zoek geen andere kaarten op. Dit kanaal is alleen voor projecten: noem nooit workflowzaken.\nStaat er \"GEEN ACTIEVE KAARTEN\", antwoord dan exact en alleen: Geen actief werk.\nAnders: schrijf de dagelijkse samenvatting voor {eigenaar}, in het Nederlands, maximaal 12 regels in totaal, met de kopjes **Af (gisteren)**, **Bezig**, **Vast**, en alleen als die er is **Meting**. Per kaart één korte regel met project en onderwerp; zijn het er te veel, vat dan samen (bijv. \"+4 meer bij <project>\"). Onder **Meting**: één regel met het aantal bouwkaarten en het gemiddelde aantal runs, reviewrondes en de doorlooptijd. Geen inleiding, geen afsluiting, geen andere tekst."

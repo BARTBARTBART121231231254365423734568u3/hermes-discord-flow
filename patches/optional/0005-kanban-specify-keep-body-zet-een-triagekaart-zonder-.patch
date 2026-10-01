@@ -1,0 +1,229 @@
+From dd88e7191dcdceb524cfb6aa7c6ba06a01c51b62 Mon Sep 17 00:00:00 2001
+From: Hermes Discord Flow <noreply@example.invalid>
+Date: Thu, 1 Oct 2026 08:54:16 +0000
+Subject: [PATCH 5/6] kanban: 'specify --keep-body' zet een triagekaart zonder
+ LLM terug naar todo
+
+Na block_loop_detected staat een kaart in triage. unblock en promote weigeren
+triage, en 'hermes kanban specify' herschrijft titel en body met een LLM. Een
+manager die de oorzaak zelf had opgelost, kon de kaart alleen via de interne
+Python-API terugzetten.
+
+- 'hermes kanban specify <id> --keep-body' laat titel en body ongemoeid, doet
+  geen LLM-aanroep, zet triage -> todo en zet de lusteller
+  (block_recurrences) op 0. Zonder die reset ging de kaart bij de
+  eerstvolgende blokkade met dezelfde oorzaak meteen terug naar triage.
+- kanban_db.specify_triage_task(..., reset_block_loop=True); het event
+  'specified' krijgt {"keep_body": true}, met een auditcommentaar als er een
+  auteur is.
+- Het LLM-pad van specify en decompose blijft ongewijzigd.
+
+Tests: tests/hermes_cli/test_kanban_specify.py (5 nieuwe tests)
+---
+ hermes_cli/kanban.py                    |  6 +-
+ hermes_cli/kanban_db.py                 | 21 +++++--
+ hermes_cli/kanban_parser.py             | 12 ++--
+ hermes_cli/kanban_specify.py            | 13 +++++
+ tests/hermes_cli/test_kanban_specify.py | 76 +++++++++++++++++++++++++
+ 5 files changed, 118 insertions(+), 10 deletions(-)
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index e5bd14a87f..8c7145de24 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -1300,10 +1300,12 @@ def _retitled_suffix(outcome) -> str:
+ 
+ 
+ def _cmd_specify(args: argparse.Namespace) -> int:
+-    """Spec a triage task (or all) via the auxiliary LLM, promote to todo."""
++    """Spec a triage task (or all) via the auxiliary LLM, promote to todo.
++    ``--keep-body``: no LLM, only promote and reset the loop counter."""
+     from hermes_cli import kanban_specify as spec
+ 
+-    return _run_triage_sweep(args, "specify", spec, spec.specify_task, "specified",
++    run_one = spec.promote_keep_body if getattr(args, "keep_body", False) else spec.specify_task
++    return _run_triage_sweep(args, "specify", spec, run_one, "specified",
+                              ("task_id", "ok", "reason", "new_title"),
+                              lambda o: f"Specified {o.task_id} → todo{_retitled_suffix(o)}")
+ 
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 413de84920..f8f73fc588 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -3927,10 +3927,15 @@ def invalidate_descendants_for_parent_reopen(
+ def specify_triage_task(
+     conn: sqlite3.Connection, task_id: str, *, title: Optional[str] = None,
+     body: Optional[str] = None, assignee: Optional[str] = None, author: Optional[str] = None,
++    reset_block_loop: bool = False,
+ ) -> bool:
+     """Update title/body/assignee (when given) and move ``triage -> todo`` in one
+     txn; False when not in triage. Lands in ``todo`` (not ``ready``) so parent
+     gating still applies; the audit comment is written only when a field changed.
++
++    ``reset_block_loop`` (``specify --keep-body``) also zeroes
++    ``block_recurrences`` -- the manager fixed the cause and re-queues the card on
++    purpose, so its next block must not route it straight back to triage.
+     """
+     if title is not None and not title.strip():
+         raise ValueError("title cannot be blank")
+@@ -3943,6 +3948,8 @@ def specify_triage_task(
+         if existing is None:
+             return False
+         sets: list[str] = ["status = 'todo'"]
++        if reset_block_loop:
++            sets.append("block_recurrences = 0")
+         params: list[Any] = []
+         changed_fields: list[str] = []
+         if title is not None and title.strip() != (existing["title"] or ""):
+@@ -3971,10 +3978,16 @@ def specify_triage_task(
+                 "Specified — updated " + ", ".join(changed_fields) + " and promoted to todo.",
+                 int(time.time()),
+             )
+-        _append_event(
+-            conn, task_id, "specified",
+-            {"changed_fields": changed_fields} if changed_fields else None,
+-        )
++        elif reset_block_loop and author and author.strip():
++            _insert_comment(
++                conn, task_id, author.strip(),
++                "Specified — body kept, promoted to todo (block-loop counter reset).",
++                int(time.time()),
++            )
++        payload: dict[str, Any] = {"changed_fields": changed_fields} if changed_fields else {}
++        if reset_block_loop:
++            payload["keep_body"] = True
++        _append_event(conn, task_id, "specified", payload or None)
+     # Own IMMEDIATE txn (outside the one above): a parent-free specified task
+     # flips to 'ready' now instead of idling until the next tick.
+     recompute_ready(conn)
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index f75a44eda0..840edaf16f 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -413,10 +413,14 @@ _SPECS = [
+          help="List known profiles + per-profile task counts (union of ~/.hermes/profiles/ and current assignees on the board)"),
+     _cmd("context", [_TASK_ID],
+          help="Print the full context a worker sees for a task (title + body + parent results + comments)."),
+-    _cmd("specify", _triage_sweep_args("specify", "Specify", "specifier"),
+-         help="Flesh out a triage-column task into a concrete spec (title + "
+-              "body) and promote it to todo. Uses the auxiliary LLM "
+-              "configured under auxiliary.triage_specifier."),
++    _cmd("specify", (
++        *_triage_sweep_args("specify", "Specify", "specifier"),
++        _arg("--keep-body", action="store_true",
++             help="No LLM: keep title and body as they are, only promote triage -> todo "
++                  "and reset the block-loop counter (after the cause was fixed)"),
++    ), help="Flesh out a triage-column task into a concrete spec (title + "
++            "body) and promote it to todo. Uses the auxiliary LLM "
++            "configured under auxiliary.triage_specifier (not with --keep-body)."),
+     _cmd("decompose", _triage_sweep_args("decompose", "Decompose", "decomposer"),
+          help="Decompose a triage-column task into a graph of child tasks "
+               "routed to specialist profiles by description. Falls back "
+diff --git a/hermes_cli/kanban_specify.py b/hermes_cli/kanban_specify.py
+index b0a7412cb1..e7b105f5bd 100644
+--- a/hermes_cli/kanban_specify.py
++++ b/hermes_cli/kanban_specify.py
+@@ -233,6 +233,19 @@ def specify_task(
+     return SpecifyOutcome(task_id, True, "specified", new_title=new_title)
+ 
+ 
++def promote_keep_body(task_id: str, *, author: Optional[str] = None) -> SpecifyOutcome:
++    """``specify --keep-body``: ``triage -> todo`` with title and body
++    untouched and no LLM call; the block-loop counter starts afresh."""
++    task, reason = _load_triage_task(task_id)
++    if task is None:
++        return SpecifyOutcome(task_id, False, reason)
++    with kbc.connect_closing() as conn:
++        ok = kb.specify_triage_task(conn, task_id, author=author or _profile_author(), reset_block_loop=True)
++    if not ok:
++        return SpecifyOutcome(task_id, False, "task moved out of triage before promotion")
++    return SpecifyOutcome(task_id, True, "specified (body kept)")
++
++
+ def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
+     """Task ids in the triage column; ``tenant`` narrows the sweep."""
+     with kbc.connect_closing() as conn:
+diff --git a/tests/hermes_cli/test_kanban_specify.py b/tests/hermes_cli/test_kanban_specify.py
+index 55f1d33d52..b353f826e4 100644
+--- a/tests/hermes_cli/test_kanban_specify.py
++++ b/tests/hermes_cli/test_kanban_specify.py
+@@ -139,3 +139,79 @@ def test_cli_specify_tenant_filter(kanban_home, capsys):
+         assert kb.get_task(conn, inside).status in {"todo", "ready"}
+ 
+ 
++
++
++# ---------------------------------------------------------------------------
++# ``specify --keep-body`` (no LLM, loop counter reset)
++# ---------------------------------------------------------------------------
++
++def _no_llm():
++    return patch("agent.auxiliary_client.call_llm",
++                 side_effect=AssertionError("--keep-body must not call the LLM"))
++
++
++def _loop_into_triage(conn, tid):
++    """Two same-cause blocks (with an unblock between) route the card to triage."""
++    for _ in range(2):
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
++        assert kb.claim_task(conn, tid, claimer="w") is not None
++        kb.block_task(conn, tid, reason="worker preflight: stale", kind="needs_input")
++        if kb.get_task(conn, tid).status == "blocked":
++            kb.unblock_task(conn, tid)
++    assert kb.get_task(conn, tid).status == "triage"
++
++
++def test_cli_specify_keep_body_promotes_without_llm(kanban_home, capsys):
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="Origineel", body="Spec blijft", triage=True)
++    with _no_llm():
++        rc = _run_cli("specify", tid, "--keep-body", "--json", "--author", "manager")
++    assert rc == 0
++    row = jsonlib.loads(capsys.readouterr().out.strip().splitlines()[-1])
++    assert row["ok"] is True and row["task_id"] == tid
++    with kbc.connect() as conn:
++        task = kb.get_task(conn, tid)
++        assert task.status in {"todo", "ready"}
++        assert (task.title, task.body) == ("Origineel", "Spec blijft")
++        specified = [e for e in kb.list_events(conn, tid) if e.kind == "specified"]
++        assert specified[-1].payload == {"keep_body": True}
++        assert any("body kept" in c.body for c in kb.list_comments(conn, tid))
++
++
++def test_cli_specify_keep_body_resets_block_loop(kanban_home):
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="t", assignee="w")
++        _loop_into_triage(conn, tid)
++        assert kb.get_task(conn, tid).block_recurrences == 2
++    with _no_llm():
++        assert _run_cli("specify", tid, "--keep-body") == 0
++    with kbc.connect() as conn:
++        assert kb.get_task(conn, tid).block_recurrences == 0
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
++        assert kb.claim_task(conn, tid, claimer="w") is not None
++        kb.block_task(conn, tid, reason="worker preflight: stale", kind="needs_input")
++        # One fresh block is allowed before the breaker routes it to triage again.
++        assert kb.get_task(conn, tid).status == "blocked"
++
++
++def test_specify_without_keep_body_keeps_upstream_counter(kanban_home):
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="t", assignee="w")
++        _loop_into_triage(conn, tid)
++        assert kb.specify_triage_task(conn, tid)
++        assert kb.get_task(conn, tid).block_recurrences == 2
++
++
++def test_cli_specify_keep_body_refuses_non_triage(kanban_home, capsys):
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="t")
++    with _no_llm():
++        assert _run_cli("specify", tid, "--keep-body") == 1
++    assert "not in triage" in capsys.readouterr().err
++
++
++def test_decompose_has_no_keep_body_flag(kanban_home):
++    with pytest.raises(SystemExit):
++        _run_cli("decompose", "t_x", "--keep-body")

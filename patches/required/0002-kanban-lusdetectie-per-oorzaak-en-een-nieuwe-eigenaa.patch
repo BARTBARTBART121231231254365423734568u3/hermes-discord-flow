@@ -1,0 +1,425 @@
+From 92bf52099ad31d34bc336effd2b4daf7b30c1587 Mon Sep 17 00:00:00 2001
+From: Hermes Discord Flow <noreply@example.invalid>
+Date: Thu, 1 Oct 2026 08:46:51 +0000
+Subject: [PATCH 2/4] kanban: lusdetectie per oorzaak, en een nieuwe
+ eigenaarsvraag is geen lus
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Upstream zet een kaart in triage zodra ze voor de tweede keer met hetzelfde
+block_kind blokkeert. Daardoor telden twee verschillende oorzaken (eerst een
+onduidelijke spec, later een kapotte databaselogin) als één lus, en ging een
+kaart die na een eerdere blokkade een echte vraag aan de eigenaar stelde naar
+triage, waar de vragenflow en kanban_unblock haar niet meer bereiken.
+
+- Een blokkade waarvan de reden begint met "Vraag voor <wie>:" (bijvoorbeeld
+  "Vraag voor de eigenaar:"; hoofdletterongevoelig, <wie> maximaal 40 tekens
+  zonder ':') is een vraag aan de eigenaar. Een NIEUWE vraag zet de lusteller
+  terug; dezelfde vraag opnieuw stellen blijft een lus. Helper:
+  kanban_db.is_owner_question().
+- De lusdetectie vergelijkt de oorzaak van een blokkade: de korte tekst vóór
+  ':' (tot 40 tekens, bijvoorbeeld "worker preflight"), anders de volledige
+  reden. Bij eigenaarsvragen en wachtstanden ("Wacht op …") is de volledige
+  reden de oorzaak. Een omgezette dependency-blokkade (geen open ouder) blijft
+  één structurele oorzaak. Wachtstand-updates (status_update) tellen niet als
+  vorige oorzaak.
+- Vangnet BLOCK_ANY_CAUSE_LIMIT = 4: vier echte blokkades sinds de laatste
+  'specified' (zonder wachtstand-updates en eigenaarsvragen) gaan naar triage,
+  ongeacht de oorzaak (event block_loop_detected met any_cause_limit).
+
+Vereist de wachtstand-patch (WAIT_STATUS_PREFIX en status_update).
+
+Tests: tests/hermes_cli/test_kanban_owner_question_block.py,
+tests/hermes_cli/test_kanban_block_cause.py; upstream
+tests/hermes_cli/test_kanban_block_kinds.py blijft groen.
+---
+ hermes_cli/kanban_db.py                       |  91 +++++++++++-
+ tests/hermes_cli/test_kanban_block_cause.py   | 133 ++++++++++++++++++
+ .../test_kanban_owner_question_block.py       | 118 ++++++++++++++++
+ 3 files changed, 341 insertions(+), 1 deletion(-)
+ create mode 100644 tests/hermes_cli/test_kanban_block_cause.py
+ create mode 100644 tests/hermes_cli/test_kanban_owner_question_block.py
+
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index bf18ac688b..413de84920 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -109,6 +109,12 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
+ # Same-reason block -> unblock -> re-block cycles before routing to ``triage``.
+ # Counts unblock recurrences, NOT dispatcher failures (``DEFAULT_FAILURE_LIMIT``).
+ BLOCK_RECURRENCE_LIMIT = 2
++# "Same reason" is judged on the block CAUSE (see ``_block_cause_key``), so
++# two different causes no longer count as a loop. Safety net for a worker that keeps
++# rewording one cause: this many ``blocked`` events since the last ``specified`` (status
++# updates and owner questions excluded, the new block included) route the card to
++# ``triage`` whatever the cause.
++BLOCK_ANY_CAUSE_LIMIT = 4
+ VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
+ 
+ 
+@@ -3282,10 +3288,16 @@ def block_task(
+         if kind == "dependency" and _parents_satisfied(conn, task_id):
+             kind = "needs_input"
+             rekind_reason = "no_open_parent"
++        prev_recurrences = int(_row_get(cur_row, "block_recurrences") or 0)
++        if _is_new_block_cause(conn, task_id, reason, rekind_reason=rekind_reason):
++            prev_recurrences = 0
+         new_status, event_kind, set_sql, params, payload = _route_block(
+             kind, reason, source_status, prev_kind=_row_get(cur_row, "block_kind"),
+-            prev_recurrences=int(_row_get(cur_row, "block_recurrences") or 0),
++            prev_recurrences=prev_recurrences,
+         )
++        if event_kind == "blocked" and _hits_any_cause_limit(conn, task_id, reason):
++            new_status, event_kind = "triage", "block_loop_detected"
++            payload["any_cause_limit"] = BLOCK_ANY_CAUSE_LIMIT
+         if rekind_reason:
+             payload["requested_kind"] = requested_kind
+             payload["rekind_reason"] = rekind_reason
+@@ -3318,6 +3330,83 @@ def block_task(
+     return True
+ 
+ 
++# Blocks whose reason starts with "Vraag voor <wie>:" (e.g. "Vraag voor de eigenaar:")
++# are questions for a human owner, typically posted to a chat forum with answer buttons.
++# A NEW question starts the loop counter afresh; re-asking the identical question still
++# counts as a loop, like any other same-cause re-block. Matched case-insensitively on the
++# whitespace-normalized reason; the addressee is at most 40 characters without ':'.
++OWNER_QUESTION_RE = re.compile(r"^vraag voor [^:\n]{1,40}:", re.IGNORECASE)
++_CAUSE_PREFIX_MAX = 40
++
++
++def _normalized_reason(reason: Optional[str]) -> str:
++    return " ".join((reason or "").lower().split())
++
++
++def is_owner_question(reason: Optional[str]) -> bool:
++    """True when ``reason`` is a question for the owner ("Vraag voor <wie>: ...")."""
++    return bool(OWNER_QUESTION_RE.match(_normalized_reason(reason)))
++
++
++def _block_cause_key(reason: Optional[str], rekind_reason: Optional[str] = None) -> str:
++    """Cause of a block: the short prefix before ':' ("worker preflight", "spec unclear"),
++    else the full normalized reason. Owner questions and wait states ("Wacht op ...") are
++    compared on the full reason: the text after ':' IS the cause there, so each question
++    or wait state is its own cause. A re-kinded block (``dependency`` with no open parent)
++    has a structural cause whatever the wording, so it keeps counting as the same loop."""
++    if rekind_reason:
++        return f"rekind:{rekind_reason}"
++    text = _normalized_reason(reason)
++    if is_owner_question(text) or text.startswith(WAIT_STATUS_PREFIX):
++        return text
++    head, sep, _ = text.partition(":")
++    return head.strip() if sep and len(head) <= _CAUSE_PREFIX_MAX else text
++
++
++def _block_payloads(conn: sqlite3.Connection, task_id: str, *, after_id: int = 0, limit: int = 50):
++    """Payload dicts of ``blocked``/``block_loop_detected`` events, newest first."""
++    rows = conn.execute(
++        "SELECT kind, payload FROM task_events WHERE task_id = ? AND id > ? "
++        "AND kind IN ('blocked', 'block_loop_detected') ORDER BY id DESC LIMIT ?",
++        (task_id, after_id, limit),
++    ).fetchall()
++    for kind, raw in rows:
++        try:
++            data = json.loads(raw) if raw else {}
++        except (TypeError, ValueError):
++            data = {}
++        yield kind, (data if isinstance(data, dict) else {})
++
++
++def _is_new_block_cause(
++    conn: sqlite3.Connection, task_id: str, reason: Optional[str], *, rekind_reason: Optional[str] = None,
++) -> bool:
++    """True when the previous real block (wait-state status updates skipped) had another
++    cause: the loop counter then starts afresh."""
++    current = _block_cause_key(reason, rekind_reason)
++    for _kind, data in _block_payloads(conn, task_id, limit=20):
++        if data.get("status_update"):
++            continue
++        return _block_cause_key(data.get("reason"), data.get("rekind_reason")) != current
++    return False
++
++
++def _hits_any_cause_limit(conn: sqlite3.Connection, task_id: str, reason: Optional[str]) -> bool:
++    """Safety net: ``BLOCK_ANY_CAUSE_LIMIT`` real blocks since the last ``specified``."""
++    if is_owner_question(reason):
++        return False
++    last = conn.execute(
++        "SELECT COALESCE(MAX(id), 0) FROM task_events WHERE task_id = ? AND kind = 'specified'",
++        (task_id,),
++    ).fetchone()[0]
++    earlier = sum(
++        1 for kind, data in _block_payloads(conn, task_id, after_id=int(last or 0), limit=1000)
++        if kind == "blocked" and not data.get("status_update")
++        and not is_owner_question(data.get("reason"))
++    )
++    return earlier + 1 >= BLOCK_ANY_CAUSE_LIMIT
++
++
+ def _route_block(
+     kind: Optional[str], reason: Optional[str], source_status: str, *,
+     prev_kind: Optional[str], prev_recurrences: int,
+diff --git a/tests/hermes_cli/test_kanban_block_cause.py b/tests/hermes_cli/test_kanban_block_cause.py
+new file mode 100644
+index 0000000000..4d4e4e35d1
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_block_cause.py
+@@ -0,0 +1,133 @@
++"""The unblock-loop breaker counts the same CAUSE, not just the same kind.
++
++Upstream routed any second block of the same ``block_kind`` to triage, so a card
++that first waited on an unclear spec and later on a DB-login fix was flagged as a
++loop. The cause key is the text before ':' (short prefix), or the full reason for
++owner questions / wait states / reasons without such a prefix. As a safety net,
++any cause counts once ``BLOCK_ANY_CAUSE_LIMIT`` blocks pile up since the last
++``specified`` (owner questions excluded).
++"""
++
++from __future__ import annotations
++
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++
++
++@pytest.fixture
++def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    kb.init_db()
++    return home
++
++
++def _run(conn, tid) -> None:
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
++    assert kb.claim_task(conn, tid, claimer="worker") is not None
++
++
++def _new(conn) -> str:
++    tid = kb.create_task(conn, title="t", assignee="worker")
++    _run(conn, tid)
++    return tid
++
++
++def _block(conn, tid, reason, kind="needs_input") -> kb.Task:
++    kb.block_task(conn, tid, reason=reason, kind=kind)
++    return kb.get_task(conn, tid)
++
++
++def _again(conn, tid, reason, kind="needs_input") -> kb.Task:
++    kb.unblock_task(conn, tid)
++    _run(conn, tid)
++    return _block(conn, tid, reason, kind)
++
++
++@pytest.mark.parametrize("kind", ["needs_input", None])
++def test_different_causes_are_not_a_loop(kanban_home, kind):
++    with kbc.connect_closing() as conn:
++        tid = _new(conn)
++        _block(conn, tid, "spec onduidelijk: acceptatiecriteria ontbreken nog", kind)
++        task = _again(conn, tid, "Wacht op: DB-login fix – password authentication failed", kind)
++        assert (task.status, task.block_recurrences) == ("blocked", 1)
++
++
++def test_same_prefix_other_detail_is_a_loop(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid = _new(conn)
++        _block(conn, tid, "worker preflight: worktree branch is stale")
++        task = _again(conn, tid, "worker preflight: worktree target is checked out on another branch")
++        assert task.status == "triage"
++        assert kb.list_events(conn, tid)[-1].kind == "block_loop_detected"
++
++
++def test_identical_reason_is_a_loop(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid = _new(conn)
++        _block(conn, tid, "needs a decision")
++        assert _again(conn, tid, "needs a decision").status == "triage"
++
++
++def test_two_different_wait_states_are_not_a_loop(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid = _new(conn)
++        _block(conn, tid, "Wacht op: spec onvolledig")
++        assert _again(conn, tid, "Wacht op: DB-login fix").status == "blocked"
++
++
++def test_same_question_after_wait_status_update_is_a_loop(kanban_home):
++    """A wait-state status update ('Wacht op …') is not a new cause: re-asking the
++    question it answered still counts as a loop."""
++    with kbc.connect_closing() as conn:
++        tid = _new(conn)
++        _block(conn, tid, "Vraag voor de eigenaar: A of B?")
++        assert kb.block_task(conn, tid, reason="Wacht op nachtrun 23:00 – antwoord A gegeven")
++        assert _again(conn, tid, "Vraag voor de eigenaar: A of B?").status == "triage"
++
++
++def test_any_cause_cap_routes_to_triage(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid = _new(conn)
++        reasons = ["oorzaak een", "oorzaak twee", "oorzaak drie", "oorzaak vier"]
++        task = _block(conn, tid, reasons[0])
++        for reason in reasons[1:-1]:
++            task = _again(conn, tid, reason)
++            assert task.status == "blocked"
++        task = _again(conn, tid, reasons[-1])
++        assert kb.BLOCK_ANY_CAUSE_LIMIT == 4
++        assert task.status == "triage"
++        last = kb.list_events(conn, tid)[-1]
++        assert last.kind == "block_loop_detected"
++        assert last.payload["any_cause_limit"] == kb.BLOCK_ANY_CAUSE_LIMIT
++
++
++def test_any_cause_cap_ignores_owner_questions_and_status_updates(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid = _new(conn)
++        _block(conn, tid, "oorzaak een")
++        assert _again(conn, tid, "Vraag voor de eigenaar: eerste?").status == "blocked"
++        assert kb.block_task(conn, tid, reason="Wacht op antwoord – gegeven")
++        assert _again(conn, tid, "Vraag voor de eigenaar: tweede?").status == "blocked"
++        assert _again(conn, tid, "oorzaak twee").status == "blocked"
++        assert _again(conn, tid, "oorzaak drie").status == "blocked"
++
++
++def test_any_cause_cap_counts_from_last_specified(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid = _new(conn)
++        _block(conn, tid, "oorzaak een")
++        _again(conn, tid, "oorzaak twee")
++        _again(conn, tid, "oorzaak drie")
++        assert _again(conn, tid, "oorzaak vier").status == "triage"
++        assert kb.specify_triage_task(conn, tid)
++        _run(conn, tid)
++        assert _block(conn, tid, "oorzaak vijf").status == "blocked"
++
+diff --git a/tests/hermes_cli/test_kanban_owner_question_block.py b/tests/hermes_cli/test_kanban_owner_question_block.py
+new file mode 100644
+index 0000000000..710101654b
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_owner_question_block.py
+@@ -0,0 +1,118 @@
++"""Owner questions ("Vraag voor <wie>: ...") and the unblock-loop breaker.
++
++A card may need several owner answers over its life, often after an earlier
++needs_input block (e.g. a worker preflight). Each NEW question must park the
++card in ``blocked`` (where a question integration and the manager's
++``kanban_unblock`` can reach it) instead of routing it to ``triage``; asking
++the identical question again after an answer still counts as a loop.
++"""
++
++from __future__ import annotations
++
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++
++
++@pytest.fixture
++def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    kb.init_db()
++    return home
++
++
++def _running_task(conn) -> str:
++    tid = kb.create_task(conn, title="t", assignee="worker")
++    _make_running_again(conn, tid)
++    return tid
++
++
++def _make_running_again(conn, tid) -> None:
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
++    assert kb.claim_task(conn, tid, claimer="worker") is not None
++
++
++def _block_after_unblock(conn, tid, reason) -> kb.Task:
++    kb.unblock_task(conn, tid)
++    _make_running_again(conn, tid)
++    kb.block_task(conn, tid, reason=reason, kind="needs_input")
++    return kb.get_task(conn, tid)
++
++
++def test_owner_question_after_earlier_block_stays_blocked(kanban_home: Path) -> None:
++    with kbc.connect_closing() as conn:
++        tid = _running_task(conn)
++        kb.block_task(conn, tid, reason="worker preflight: branch is stale", kind="needs_input")
++        task = _block_after_unblock(conn, tid, "Vraag voor de eigenaar: één dag of alle dagen?\nOpties: 1) dag 2) alle")
++        assert (task.status, task.block_recurrences) == ("blocked", 1)
++
++
++def test_distinct_owner_questions_each_stay_blocked(kanban_home: Path) -> None:
++    with kbc.connect_closing() as conn:
++        tid = _running_task(conn)
++        kb.block_task(conn, tid, reason="Vraag voor de eigenaar: eerste vraag?", kind="needs_input")
++        task = _block_after_unblock(conn, tid, "vraag voor de eigenaar: tweede vraag?")
++        assert task.status == "blocked"
++        task = _block_after_unblock(conn, tid, "VRAAG VOOR de product owner: derde vraag?")
++        assert task.status == "blocked"
++
++
++def test_identical_owner_question_still_counts_as_loop(kanban_home: Path) -> None:
++    with kbc.connect_closing() as conn:
++        tid = _running_task(conn)
++        kb.block_task(conn, tid, reason="Vraag voor de eigenaar: dezelfde vraag?", kind="needs_input")
++        task = _block_after_unblock(conn, tid, "Vraag voor de eigenaar: dezelfde vraag?")
++        assert task.status == "triage"
++
++
++def test_other_reasons_loop_on_the_same_cause(kanban_home: Path) -> None:
++    """Other reasons loop on the same cause (prefix before ':'), not on any
++    second block of the same kind; see test_kanban_block_cause.py."""
++    with kbc.connect_closing() as conn:
++        tid = _running_task(conn)
++        kb.block_task(conn, tid, reason="need a decision: A", kind="needs_input")
++        task = _block_after_unblock(conn, tid, "need a decision: B (reworded)")
++        assert task.status == "triage"
++
++
++def test_card_in_triage_can_ask_a_new_question(kanban_home: Path) -> None:
++    """A card that looped into triage (preflight) and is promoted again can still ask."""
++    with kbc.connect_closing() as conn:
++        tid = _running_task(conn)
++        kb.block_task(conn, tid, reason="worker preflight: stale", kind="needs_input")
++        task = _block_after_unblock(conn, tid, "worker preflight: stale")
++        assert task.status == "triage"
++        assert kb.specify_triage_task(conn, tid)
++        _make_running_again(conn, tid)
++        kb.block_task(conn, tid, reason="Vraag voor de eigenaar: nieuwe vraag?", kind="needs_input")
++        assert kb.get_task(conn, tid).status == "blocked"
++
++
++@pytest.mark.parametrize("reason", [
++    "Vraag voor de eigenaar: A of B?",
++    "vraag voor Sam: A of B?",
++    "VRAAG VOOR  het team : A of B?",
++    "Vraag voor de product owner:\nOpties: 1) A 2) B",
++])
++def test_owner_question_prefix_accepts_any_addressee(reason: str) -> None:
++    assert kb.is_owner_question(reason)
++
++
++@pytest.mark.parametrize("reason", [
++    "Vraag: A of B?",
++    "Vraag voor: A of B?",
++    "Vraag voor " + "x" * 41 + ": A of B?",
++    "Een vraag voor de eigenaar: A of B?",
++    "worker preflight: branch is stale",
++    "",
++    None,
++])
++def test_other_reasons_are_not_owner_questions(reason) -> None:
++    assert not kb.is_owner_question(reason)

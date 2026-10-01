@@ -1,0 +1,161 @@
+From 426bad33bd91d55aa83fad405da621396783e0bf Mon Sep 17 00:00:00 2001
+From: Hermes Discord Flow <noreply@example.invalid>
+Date: Thu, 1 Oct 2026 08:54:53 +0000
+Subject: [PATCH 6/6] kanban: kaart van een worker erft het project, ook bij
+ workspace_kind 'worktree'
+
+Een worker maakte met kanban_create een vervolgkaart met
+workspace_kind="worktree" maar zonder project. Upstream erft het project van
+de eigen kaart (HERMES_KANBAN_TASK) alleen als alle workspace-velden
+ontbreken, dus de kaart kreeg een worktree zonder pad of repository-anker en
+faalde pas toen haar worker startte.
+
+- Ook 'worktree' zonder pad erft nu het project van de eigen kaart (via
+  project_source_task_id, ook over profielen heen). 'scratch', 'dir', een pad
+  of een expliciet project (ook "") zetten het erven uit, zoals voorheen.
+- Een worktree-kaart zonder pad, project, bordproject of default_workdir van
+  het bord wordt meteen geweigerd met een duidelijke melding, in plaats van
+  later bij de start van de worker.
+
+Tests: tests/tools/test_kanban_create_inherit_project.py
+---
+ .../test_kanban_create_inherit_project.py     | 104 ++++++++++++++++++
+ tools/kanban_tools.py                         |  12 +-
+ 2 files changed, 115 insertions(+), 1 deletion(-)
+ create mode 100644 tests/tools/test_kanban_create_inherit_project.py
+
+diff --git a/tests/tools/test_kanban_create_inherit_project.py b/tests/tools/test_kanban_create_inherit_project.py
+new file mode 100644
+index 0000000000..01c9d1c2ee
+--- /dev/null
++++ b/tests/tools/test_kanban_create_inherit_project.py
+@@ -0,0 +1,104 @@
++"""A worker's ``kanban_create`` inherits the project of its own card.
++
++A worker created a follow-up card with ``workspace_kind="worktree"`` but no
++``project``. Upstream only inherited the project when all workspace fields were
++omitted, so the card got a worktree without a path or repository anchor and
++failed when its worker started. "worktree" without a path is exactly what a project
++worktree provides, so it inherits too; a worktree card that still has no project,
++path, board project or board default_workdir is refused up front.
++"""
++
++from __future__ import annotations
++
++import json
++import os
++from pathlib import Path
++
++import pytest
++
++
++@pytest.fixture
++def project_worker(monkeypatch, tmp_path):
++    """A dispatcher worker whose own card is linked to a project."""
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_PROFILE", "designer")
++    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import projects_db as pdb
++
++    repo = tmp_path / "repo"
++    repo.mkdir()
++    with pdb.connect_closing() as pconn:
++        pid = pdb.create_project(pconn, name="Demo App", primary_path=str(repo))
++        project = pdb.get_project(pconn, pid)
++    kb._INITIALIZED_PATHS.clear()
++    kb.init_db()
++    conn = kbc.connect()
++    try:
++        tid = kb.create_task(conn, title="ontwerp", assignee="designer", project_id=pid)
++        kb.claim_task(conn, tid)
++        run_id = kb._current_run_id(conn, tid)
++    finally:
++        conn.close()
++    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
++    return tid, project, repo
++
++
++def _create(**args):
++    from tools import kanban_tools as kt
++    return json.loads(kt._handle_create({"title": "vervolg", "assignee": "coder", **args}))
++
++
++def _task(tid):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    with kbc.connect_closing() as conn:
++        return kb.get_task(conn, tid)
++
++
++def test_explicit_worktree_inherits_the_worker_project(project_worker):
++    tid, project, repo = project_worker
++    out = _create(parents=[tid], workspace_kind="worktree")
++    assert out["ok"] is True, out
++    assert (out["project_id"], out["workspace_kind"]) == (project.id, "worktree")
++    child = _task(out["task_id"])
++    assert child.workspace_path == os.path.join(str(repo), ".worktrees", child.id)
++    assert child.branch_name.startswith(f"{project.slug}/{child.id}")
++
++
++def test_omitted_workspace_still_inherits(project_worker):
++    tid, project, _ = project_worker
++    out = _create()
++    assert (out["project_id"], out["workspace_kind"]) == (project.id, "worktree")
++
++
++@pytest.mark.parametrize("explicit", [{"workspace_kind": "scratch"}, {"project": ""}])
++def test_explicit_opt_out_stays_without_project(project_worker, explicit):
++    out = _create(**explicit)
++    assert out["ok"] is True, out
++    assert (out["workspace_kind"], out["project_id"]) == ("scratch", None)
++
++
++def test_worktree_without_any_project_is_refused(project_worker, monkeypatch):
++    """No inheritable project (not a dispatcher worker) and no path: refuse up front."""
++    monkeypatch.delenv("HERMES_KANBAN_TASK")
++    monkeypatch.delenv("HERMES_KANBAN_RUN_ID")
++    out = _create(workspace_kind="worktree")
++    assert "error" in out
++    assert "project" in out["error"]
++
++
++def test_worktree_with_a_board_default_workdir_is_allowed(project_worker, monkeypatch, tmp_path):
++    """The board's ``default_workdir`` is a valid worktree anchor (upstream behaviour)."""
++    from hermes_cli import kanban_db as kb
++    monkeypatch.delenv("HERMES_KANBAN_TASK")
++    monkeypatch.delenv("HERMES_KANBAN_RUN_ID")
++    monkeypatch.setattr(kb, "_board_meta_for", lambda _board: {"default_workdir": str(tmp_path / "repo")})
++    out = _create(workspace_kind="worktree")
++    assert out.get("ok") is True, out
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 896c313049..763d29c237 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1030,9 +1030,19 @@ def _handle_create(args: dict, **kw) -> str:
+                       or (self_task.session_id if self_task else None)
+                       or _persisted_session_id(_current_origin_session_id())
+                       or _persisted_session_id(get_session_env("HERMES_SESSION_ID", "")))
+-        if project_id is None and workspace_kind is None and workspace_path is None:
++        # A worker's card that asks for "worktree" without a path wants exactly what a
++        # project worktree provides, so it inherits the project of its own card too; only
++        # "scratch"/"dir", a path or an explicit project (also "") opt out.
++        if project_id is None and workspace_kind in (None, "worktree") and workspace_path is None:
+             if self_task is not None and self_task.project_id:
+                 project_id, project_source_task_id = self_task.project_id, self_task.id
++        # A worktree card without a path, project, board project or board default_workdir has
++        # no repository anchor and would only fail when its worker starts: refuse it here.
++        if workspace_kind == "worktree" and not workspace_path and not project_id:
++            board_meta = kb._board_meta_for(args.get("board"))
++            _check(any((board_meta.get(key) or "").strip() for key in ("project_id", "default_workdir")),
++                   "workspace_kind='worktree' needs a project or a workspace_path: pass "
++                   "project=<project id or slug> (or omit workspace_kind for a scratch task)")
+         new_tid = kb.create_task(
+             conn, title=str(title).strip(), body=args.get("body"), assignee=str(assignee),
+             parents=tuple(parents), tenant=args.get("tenant") or os.environ.get("HERMES_TENANT"),

@@ -1,0 +1,9 @@
+[Unit]
+Description=Hermes gezondheidscheck: blokkerend in #meldingen, de rest stil in #gezondheid (state/health.json)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 %h/.hermes/scripts/hermes-health.py
+TimeoutStartSec=180
+Nice=10

@@ -1,0 +1,157 @@
+From f2a503364ffafe6b1d1adb4116171d9647bad86e Mon Sep 17 00:00:00 2001
+From: Hermes Discord Flow <noreply@example.invalid>
+Date: Thu, 1 Oct 2026 08:51:50 +0000
+Subject: [PATCH 2/6] kanban: een implementer reviewt nooit zijn eigen kaart
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Een implementer die kanban_request_review aanroept zonder reviewer= blijft
+assignee. De reviewbaan startte dan de coder zelf met sdlc-review: die keurde
+zijn eigen werk goed en rondde de kaart af zonder merge naar staging.
+
+Vóór de start van een reviewworker gaat een kaart waarvan de assignee geen
+reviewprofiel is (REVIEW_PROFILES: reviewer, security, designer) eerst naar
+DEFAULT_REVIEW_PROFILE ("reviewer"), als dat profiel bestaat. Gevraagde
+wijzigingen gaan nog steeds terug naar de implementer van het event
+review_requested. Een dry run wijst niets toe. Pas de twee constanten in
+hermes_cli/kanban_db_dispatch.py aan als je reviewprofielen anders heten.
+
+Tests: tests/hermes_cli/test_kanban_review_self_guard.py
+---
+ hermes_cli/kanban_db_dispatch.py              | 27 ++++++-
+ .../test_kanban_review_self_guard.py          | 80 +++++++++++++++++++
+ 2 files changed, 106 insertions(+), 1 deletion(-)
+ create mode 100644 tests/hermes_cli/test_kanban_review_self_guard.py
+
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 0f85af1e57..a09a08cba2 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -1988,6 +1988,30 @@ def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -
+         return spawn_fn(task, workspace)
+ 
+ 
++# Review cards only run under a review profile. An implementer that asks for
++# review without ``reviewer=`` stays the assignee, which would spawn a
++# self-review (no merge to staging); hand such cards to the default reviewer
++# before the review worker starts.
++REVIEW_PROFILES = frozenset({"reviewer", "security", "designer"})
++DEFAULT_REVIEW_PROFILE = "reviewer"
++
++
++def _review_assignee(conn: sqlite3.Connection, row: sqlite3.Row, *, dry_run: bool) -> str:
++    assignee = row["assignee"]
++    if assignee in REVIEW_PROFILES:
++        return assignee
++    profile_exists = _profile_exists_fn()
++    if profile_exists is not None and not profile_exists(DEFAULT_REVIEW_PROFILE):
++        return assignee
++    if not dry_run:
++        try:
++            _kb.assign_task(conn, row["id"], DEFAULT_REVIEW_PROFILE)
++        except RuntimeError:
++            return assignee
++        _kb._log.info("kanban: review of %s moved from %s to %s", row["id"], assignee, DEFAULT_REVIEW_PROFILE)
++    return DEFAULT_REVIEW_PROFILE
++
++
+ def _dispatch_lane_task(
+     conn: sqlite3.Connection,
+     row: sqlite3.Row,
+@@ -2390,7 +2414,8 @@ def _dispatch_once_locked(
+         if not row["assignee"]:
+             result.skipped_unassigned.append(row["id"])
+             continue
+-        if _dispatch_lane_task(conn, row, row["assignee"], result, lane="review", **lane_kwargs):
++        assignee = _review_assignee(conn, row, dry_run=dry_run)
++        if _dispatch_lane_task(conn, row, assignee, result, lane="review", **lane_kwargs):
+             spawned += 1
+     return result
+ 
+diff --git a/tests/hermes_cli/test_kanban_review_self_guard.py b/tests/hermes_cli/test_kanban_review_self_guard.py
+new file mode 100644
+index 0000000000..a97a78bb51
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_review_self_guard.py
+@@ -0,0 +1,80 @@
++"""A review card whose assignee is not a review profile (the implementer asked
++for review without ``reviewer=``) is handed to the default reviewer before the
++review worker starts, so a coder never reviews and completes its own work."""
++
++from __future__ import annotations
++
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++
++
++@pytest.fixture
++def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: lambda _name: True)
++    kb.init_db()
++    return home
++
++
++def _in_review(conn, implementer: str, reviewer=None) -> str:
++    tid = kb.create_task(conn, title="card", assignee=implementer)
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
++    assert kb.claim_task(conn, tid, claimer=implementer) is not None
++    assert kb.request_review(conn, tid, summary="built it", reviewer=reviewer)
++    return tid
++
++
++def _dispatch(conn, **kwargs):
++    spawned = []
++    kbd.dispatch_once(conn, spawn_fn=lambda task, ws, board=None: spawned.append((task.id, task.assignee)) or 4242,
++                      **kwargs)
++    return spawned
++
++
++def test_review_without_reviewer_is_moved_to_reviewer_before_spawn(kanban_home):
++    with kbc.connect() as conn:
++        tid = _in_review(conn, "coder")
++        assert kb.get_task(conn, tid).assignee == "coder"
++        assert _dispatch(conn) == [(tid, "reviewer")]
++        assigned = [e.payload for e in kb.list_events(conn, tid) if e.kind == "assigned"]
++        assert assigned[-1] == {"assignee": "reviewer", "from": "coder"}
++
++
++@pytest.mark.parametrize("profile", ["reviewer", "security", "designer"])
++def test_review_profiles_are_kept(kanban_home, profile):
++    with kbc.connect() as conn:
++        tid = _in_review(conn, "coder", reviewer=profile)
++        assert _dispatch(conn) == [(tid, profile)]
++
++
++def test_dry_run_does_not_reassign(kanban_home):
++    with kbc.connect() as conn:
++        tid = _in_review(conn, "coder")
++        kbd.dispatch_once(conn, dry_run=True)
++        assert kb.get_task(conn, tid).assignee == "coder"
++
++
++def test_no_reviewer_profile_leaves_card_untouched(kanban_home, monkeypatch):
++    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: lambda name: name != "reviewer")
++    with kbc.connect() as conn:
++        tid = _in_review(conn, "coder")
++        _dispatch(conn)
++        assert kb.get_task(conn, tid).assignee == "coder"
++
++
++def test_changes_still_return_to_the_implementer(kanban_home):
++    with kbc.connect() as conn:
++        tid = _in_review(conn, "coder")
++        _dispatch(conn)
++        ok, implementer = kb.request_changes(conn, tid, reason="1. test ontbreekt")
++        assert ok and implementer == "coder"
++        assert kb.get_task(conn, tid).assignee == "coder"

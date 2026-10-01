@@ -1,0 +1,8 @@
+[Unit]
+Description=Hermes: nachtelijke controle van de Discord-flow (flow-controle.py, schrijft state/regressie.json)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 %h/.hermes/scripts/flow-controle.py
+TimeoutStartSec=3600
+Nice=10

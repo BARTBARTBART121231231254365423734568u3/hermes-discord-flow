@@ -1,0 +1,9 @@
+[Unit]
+Description=Hermes: nachtelijke controle (flow-config tijden.nachtcontrole)
+
+[Timer]
+OnCalendar=*-*-* @NACHTCONTROLE@:00 @TIJDZONE@
+Persistent=true
+
+[Install]
+WantedBy=timers.target

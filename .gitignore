@@ -1,0 +1,11 @@
+# Lokale, persoonlijke bestanden: nooit in git
+flow.yaml
+*.local.yaml
+.env
+*.env
+auth.json
+discord.json
+state/
+logs/
+__pycache__/
+*.pyc

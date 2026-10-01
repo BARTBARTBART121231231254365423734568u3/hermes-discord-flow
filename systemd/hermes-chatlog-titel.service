@@ -1,0 +1,6 @@
+[Unit]
+Description=Hermes: vaste titel "#chatlog <datum>" voor de nieuwe #chatlog-sessie na de rotatie
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 %h/.hermes/scripts/chatlog-rotate.py --titel

@@ -1,0 +1,9 @@
+[Unit]
+Description=Hermes: #chatlog-sessie elke nacht vernieuwen (flow-config tijden.chatlog_rotatie)
+
+[Timer]
+OnCalendar=*-*-* @CHATLOG_ROTATIE@:00 @TIJDZONE@
+Persistent=false
+
+[Install]
+WantedBy=timers.target

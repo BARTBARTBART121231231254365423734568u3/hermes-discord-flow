@@ -1,0 +1,8 @@
+[Unit]
+Description=Hermes: #chatlog-titel elke 15 minuten controleren
+
+[Timer]
+OnCalendar=*:02,17,32,47
+
+[Install]
+WantedBy=timers.target

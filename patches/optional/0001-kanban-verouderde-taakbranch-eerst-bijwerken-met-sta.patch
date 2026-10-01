@@ -1,0 +1,288 @@
+From d2fa046c45a4e88b5027537b34bae805e54e66a4 Mon Sep 17 00:00:00 2001
+From: Hermes Discord Flow <noreply@example.invalid>
+Date: Thu, 1 Oct 2026 08:51:29 +0000
+Subject: [PATCH 1/6] =?UTF-8?q?kanban:=20verouderde=20taakbranch=20eerst?=
+ =?UTF-8?q?=20bijwerken=20met=20staging=20v=C3=B3=C3=B3r=20coder-=20of=20r?=
+ =?UTF-8?q?eviewstart?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Een taakbranch die van een oudere staging is afgetakt, start na elke merge
+van een andere kaart op een verouderde basis. De dispatcher merget nu de HEAD
+van de projectcheckout (staging) in een schone taakbranch, vlak voordat een
+worker start, voor zowel de ready- als de reviewbaan.
+
+- Lukt de merge, dan start de worker gewoon (mergecommit met
+  "[kanban: branch bijgewerkt voor start]").
+- Bij een conflict wordt de merge afgebroken en blokkeert de kaart met
+  "beslissing manager: conflict in <bestanden> …" (needs_input).
+- Heeft de stagingcheckout nog niet-gepushte commits (een reviewer is bezig
+  met mergen en verifiëren), dan wacht de start een tick
+  (respawn_guarded met REFRESH_DEFER) in plaats van een ongeverifieerde
+  commit te verspreiden.
+- Een vuile worktree, een andere branch of ontbrekende git-metadata wordt
+  niet aangeraakt. Een dry run merget nooit.
+
+Tests: tests/hermes_cli/test_kanban_worktree_refresh.py
+---
+ hermes_cli/kanban_db_dispatch.py              |  13 ++
+ hermes_cli/kanban_db_workspace.py             |  56 +++++++
+ .../test_kanban_worktree_refresh.py           | 157 ++++++++++++++++++
+ 3 files changed, 226 insertions(+)
+ create mode 100644 tests/hermes_cli/test_kanban_worktree_refresh.py
+
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 17b3460447..0f85af1e57 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -2038,6 +2038,19 @@ def _dispatch_lane_task(
+                 _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason})
+         return False
+ 
++    # Bring a stale task branch up to date with the project's staging checkout
++    # before both the coder start and the review start; a conflict parks the
++    # card for the manager instead of starting a worker on an outdated base.
++    if not dry_run:
++        refresh_error = _kbw.refresh_worktree_branch(_kb.get_task(conn, task_id))
++        if refresh_error == _kbw.REFRESH_DEFER:
++            result.respawn_guarded.append((task_id, refresh_error))
++            return False
++        if refresh_error:
++            _kb.block_task(conn, task_id, kind="needs_input", reason=refresh_error)
++            result.respawn_guarded.append((task_id, refresh_error))
++            return False
++
+     def _count_spawn(name: str) -> None:
+         # Later rows in this tick respect the per-profile cap; subsequent
+         # ticks re-query from the DB.
+diff --git a/hermes_cli/kanban_db_workspace.py b/hermes_cli/kanban_db_workspace.py
+index ec8e979f4a..1e408b6049 100644
+--- a/hermes_cli/kanban_db_workspace.py
++++ b/hermes_cli/kanban_db_workspace.py
+@@ -457,6 +457,62 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
+         )
+ 
+ 
++REFRESH_DEFER = "defer: staging checkout has unpushed commits"
++
++
++def refresh_worktree_branch(task: Task) -> Optional[str]:
++    """Merge the repository HEAD (the project's staging checkout) into an
++    existing task worktree branch that no longer contains it, so a card whose
++    base moved on starts (coder or review) on the current staging instead of an
++    outdated base. Only acts on a clean linked worktree that is on its own
++    branch; anything else is left as it is. Returns ``None`` when the branch is
++    (now) current, :data:`REFRESH_DEFER` while the staging checkout is ahead of
++    its upstream, or a ``"beslissing manager: ..."`` block reason after aborting
++    a failed merge."""
++    if task.workspace_kind != "worktree" or not task.workspace_path:
++        return None
++    branch = (task.branch_name or "").strip() or f"wt/{task.id}"
++    wt = Path(task.workspace_path).expanduser()
++    if not wt.exists() or not _is_linked_worktree_checkout(wt):
++        return None
++    repo_root = _repo_root_for_worktree_target(wt.parent)
++    if repo_root is None or not _git_branch_exists(repo_root, branch):
++        return None
++    common = _git_common_dir(wt)
++    if common is None or common != _git_common_dir(repo_root):  # missing metadata never proves ownership
++        return None
++    base = _kb._git_out(repo_root, "rev-parse", "HEAD")
++    if not base or _git(repo_root, "merge-base", "--is-ancestor", base, branch, timeout=30).returncode == 0:
++        return None
++    if _git_current_branch(wt) != branch:
++        return None
++    head_branch = _kb._git_out(repo_root, "branch", "--show-current")
++    published = _kb._git_out(repo_root, "rev-parse", "--verify", "-q", "@{upstream}") or (
++        head_branch and _kb._git_out(repo_root, "rev-parse", "--verify", "-q", f"refs/remotes/origin/{head_branch}"))
++    ahead = _git(repo_root, "rev-list", "--count", f"{published}..HEAD", timeout=30) if published else None
++    if ahead is not None and ahead.returncode == 0 and ahead.stdout.strip() not in ("", "0"):
++        # A reviewer is mid-merge (merged locally, verify/push pending): never
++        # spread an unverified staging commit; retry on a later tick.
++        return REFRESH_DEFER
++    status = _git(wt, "status", "--porcelain", "--untracked-files=no", timeout=60)
++    if status.returncode != 0 or status.stdout.strip():
++        return None
++    staging = head_branch or base[:12]
++    merge = _git(wt, "merge", "--no-edit", "-m",
++                 f"Merge {staging} ({base[:12]}) into {branch} [kanban: branch bijgewerkt voor start]",
++                 base, timeout=300)
++    if merge.returncode == 0:
++        _kb._log.info("kanban: refreshed %s for %s with %s @ %s", branch, task.id, staging, base[:12])
++        return None
++    conflicts = _git(wt, "diff", "--name-only", "--diff-filter=U", timeout=60).stdout.split()
++    _git(wt, "merge", "--abort", timeout=60)
++    if conflicts:
++        shown = ", ".join(conflicts[:10]) + (f" (+{len(conflicts) - 10})" if len(conflicts) > 10 else "")
++        return f"beslissing manager: conflict in {shown} (branch {branch} bijwerken met {staging})"
++    detail = (merge.stderr or merge.stdout or "").strip().splitlines()[-1:] or ["onbekende fout"]
++    return f"beslissing manager: branch {branch} bijwerken met {staging} mislukt: {detail[0][:200]}"
++
++
+ def _anchored_worktree(repo_root: Path, task_id: str, branch_name: str) -> tuple[Path, str]:
+     """Materialize the canonical ``<repo>/.worktrees/<task-id>`` worktree."""
+     target = repo_root / ".worktrees" / task_id
+diff --git a/tests/hermes_cli/test_kanban_worktree_refresh.py b/tests/hermes_cli/test_kanban_worktree_refresh.py
+new file mode 100644
+index 0000000000..a109258eb9
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_worktree_refresh.py
+@@ -0,0 +1,157 @@
++"""Stale task branches are brought up to date with the staging checkout before
++a worker (coder or review) starts; a conflict parks the card for the manager.
++
++Before this, a task branch cut from an older staging started its worker on an
++outdated base (or was parked by a worker preflight that requires the
++repository HEAD) every time another card was merged.
++"""
++
++from __future__ import annotations
++
++import subprocess
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_db_workspace as kbw
++
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: lambda _: True)
++    kb.init_db()
++    return home
++
++
++def _git(cwd: Path, *args: str) -> str:
++    return subprocess.run(
++        ["git", "-C", str(cwd), "-c", "user.name=Test User", "-c", "user.email=noreply@example.invalid",
++         "-c", "commit.gpgsign=false", *args],
++        check=True, capture_output=True, text=True,
++    ).stdout.strip()
++
++
++def _commit(repo: Path, name: str, text: str, msg: str) -> None:
++    (repo / name).write_text(text, encoding="utf-8")
++    _git(repo, "add", name)
++    _git(repo, "commit", "-m", msg)
++
++
++@pytest.fixture
++def staging_repo(tmp_path):
++    """``repo`` checked out on ``staging`` with an ``origin`` remote, plus a
++    task worktree on its own branch holding one commit."""
++    origin = tmp_path / "origin.git"
++    subprocess.run(["git", "init", "--bare", "-b", "staging", str(origin)], check=True, capture_output=True)
++    repo = tmp_path / "repo"
++    subprocess.run(["git", "init", "-b", "staging", str(repo)], check=True, capture_output=True)
++    for key, value in (("user.name", "Test User"), ("user.email", "noreply@example.invalid"), ("commit.gpgsign", "false")):
++        _git(repo, "config", key, value)
++    _commit(repo, "README.md", "base\n", "init")
++    _git(repo, "remote", "add", "origin", str(origin))
++    _git(repo, "push", "origin", "staging")
++    wt = repo / ".worktrees" / "task"
++    _git(repo, "worktree", "add", str(wt), "-b", "proj/task", "HEAD")
++    _commit(wt, "feature.txt", "feature\n", "task work")
++    return repo, wt
++
++
++def _advance_staging(repo: Path, name: str = "other.txt", text: str = "other\n", push: bool = True) -> str:
++    _commit(repo, name, text, "another card merged")
++    if push:
++        _git(repo, "push", "origin", "staging")
++    return _git(repo, "rev-parse", "HEAD")
++
++
++def _task(conn, wt: Path) -> str:
++    return kb.create_task(conn, title="card", assignee="coder", workspace_kind="worktree",
++                          workspace_path=str(wt), branch_name="proj/task")
++
++
++def _contains(repo: Path, commit: str, branch: str) -> bool:
++    return subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", commit, branch]).returncode == 0
++
++
++def test_stale_branch_is_merged_with_staging_and_worker_starts(kanban_home, staging_repo):
++    repo, wt = staging_repo
++    head = _advance_staging(repo)
++    spawned = []
++    with kbc.connect() as conn:
++        tid = _task(conn, wt)
++        kbd.dispatch_once(conn, spawn_fn=lambda task, ws, board=None: spawned.append(task.id) or 4242)
++        task = kb.get_task(conn, tid)
++    assert spawned == [tid]
++    assert task.status == "running"
++    assert _contains(repo, head, "proj/task")
++    assert (wt / "feature.txt").exists() and (wt / "other.txt").exists()
++    assert "branch bijgewerkt voor start" in _git(wt, "log", "-1", "--format=%s")
++
++
++def test_conflict_aborts_merge_and_blocks_for_manager(kanban_home, staging_repo):
++    repo, wt = staging_repo
++    before = _git(wt, "rev-parse", "HEAD")
++    _advance_staging(repo, name="feature.txt", text="staging version\n")
++    with kbc.connect() as conn:
++        tid = _task(conn, wt)
++        kbd.dispatch_once(conn, spawn_fn=lambda *_a, **_k: pytest.fail("spawned"))
++        task = kb.get_task(conn, tid)
++        reason = conn.execute(
++            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'blocked' ORDER BY id DESC LIMIT 1",
++            (tid,),
++        ).fetchone()[0]
++    assert task.status == "blocked"
++    assert "beslissing manager: conflict in feature.txt" in reason
++    assert _git(wt, "rev-parse", "HEAD") == before
++    assert _git(wt, "status", "--porcelain") == ""
++    assert not (Path(_git(wt, "rev-parse", "--git-dir")) / "MERGE_HEAD").exists()
++
++
++def test_unpushed_staging_commit_defers_without_blocking(kanban_home, staging_repo):
++    repo, wt = staging_repo
++    before = _git(wt, "rev-parse", "HEAD")
++    _advance_staging(repo, push=False)  # reviewer merged locally, verify/push still running
++    with kbc.connect() as conn:
++        tid = _task(conn, wt)
++        result = kbd.dispatch_once(conn, spawn_fn=lambda *_a, **_k: pytest.fail("spawned"))
++        task = kb.get_task(conn, tid)
++    assert task.status == "ready"
++    assert (tid, kbw.REFRESH_DEFER) in result.respawn_guarded
++    assert _git(wt, "rev-parse", "HEAD") == before
++
++
++def test_dry_run_never_merges(kanban_home, staging_repo):
++    repo, wt = staging_repo
++    before = _git(wt, "rev-parse", "HEAD")
++    _advance_staging(repo)
++    with kbc.connect() as conn:
++        tid = _task(conn, wt)
++        kbd.dispatch_once(conn, dry_run=True)
++        assert kb.get_task(conn, tid).status == "ready"
++    assert _git(wt, "rev-parse", "HEAD") == before
++
++
++def test_current_branch_is_left_alone(kanban_home, staging_repo):
++    repo, wt = staging_repo
++    before = _git(wt, "rev-parse", "HEAD")
++    with kbc.connect() as conn:
++        task = kb.get_task(conn, _task(conn, wt))
++    assert kbw.refresh_worktree_branch(task) is None
++    assert _git(wt, "rev-parse", "HEAD") == before
++
++
++def test_dirty_worktree_is_not_touched(kanban_home, staging_repo):
++    repo, wt = staging_repo
++    before = _git(wt, "rev-parse", "HEAD")
++    _advance_staging(repo)
++    (wt / "feature.txt").write_text("uncommitted\n", encoding="utf-8")
++    with kbc.connect() as conn:
++        task = kb.get_task(conn, _task(conn, wt))
++    assert kbw.refresh_worktree_branch(task) is None  # a dirty worktree is never merged into
++    assert _git(wt, "rev-parse", "HEAD") == before

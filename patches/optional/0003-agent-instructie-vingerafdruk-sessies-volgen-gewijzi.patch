@@ -1,0 +1,378 @@
+From a7f22a538b6e2c0b31ee3f9e4fa8e7ca9372046c Mon Sep 17 00:00:00 2001
+From: Hermes Discord Flow <noreply@example.invalid>
+Date: Thu, 1 Oct 2026 08:53:05 +0000
+Subject: [PATCH 3/6] agent: instructie-vingerafdruk, sessies volgen gewijzigde
+ instructies bij de volgende beurt
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Een systeemprompt wordt één keer opgebouwd en daarna hergebruikt (prefix
+cache, en na een herstart uit de opgeslagen snapshot). Een gewijzigde SOUL.md
+of config.yaml bereikte daardoor alleen nieuwe sessies; lange chatthreads en
+desktopsessies bleven dagen op oude instructies draaien.
+
+Opt-in met agent.instruction_fingerprint: true (zonder de sleutel is het gedrag
+gelijk aan upstream, en blijven de upstream-tests ongewijzigd).
+- Elk opgebouwd systeemprompt eindigt op "[Instructieversie <fp>]": een hash
+  van <home>/SOUL.md, de extra bestanden uit
+  agent.instruction_fingerprint_files (paden relatief aan de Hermes-root,
+  bijvoorbeeld team/TEAM.md) en <home>/config.yaml.
+- Een opgeslagen prompt met een andere vingerafdruk (of zonder stempel terwijl
+  er een SOUL.md is) wordt niet hergebruikt; een gecachet prompt met een andere
+  stempel vervalt vóór de volgende beurt. Die beurt bouwt het prompt opnieuw op
+  en slaat het op; het gesprek zelf blijft staan. Ongewijzigde bestanden houden
+  dezelfde vingerafdruk, dus de cache blijft werken.
+- Nieuw bestand agent/instruction_fingerprint.py; haken in
+  agent/system_prompt.py, agent/conversation_loop.py en agent/turn_context.py.
+
+Tests: tests/agent/test_instruction_fingerprint.py
+---
+ agent/conversation_loop.py                  |   8 ++
+ agent/instruction_fingerprint.py            | 141 ++++++++++++++++++++
+ agent/system_prompt.py                      |   4 +-
+ agent/turn_context.py                       |  10 ++
+ tests/agent/test_instruction_fingerprint.py | 131 ++++++++++++++++++
+ 5 files changed, 293 insertions(+), 1 deletion(-)
+ create mode 100644 agent/instruction_fingerprint.py
+ create mode 100644 tests/agent/test_instruction_fingerprint.py
+
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index 21c3c493e0..d4e5772504 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -796,6 +796,14 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
+ def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
+     """Return False when the persisted runtime-identity lines are stale."""
+ 
++    # Instruction fingerprint (opt-in): a snapshot built from other instructions (SOUL.md, config.yaml,
++    # extra instruction files) than the current ones, or from before the stamp existed, is rebuilt.
++    from agent.instruction_fingerprint import is_current
++    if not is_current(prompt):
++        logger.info("Stored system prompt for session %s predates the current instructions "
++                    "(instruction files changed); rebuilding.", getattr(agent, "session_id", "?"))
++        return False
++
+     _identity, runtime_marker, runtime = split_runtime_boundary(prompt)
+ 
+     def host_info_value(label: str) -> str:
+diff --git a/agent/instruction_fingerprint.py b/agent/instruction_fingerprint.py
+new file mode 100644
+index 0000000000..b568a14bf8
+--- /dev/null
++++ b/agent/instruction_fingerprint.py
+@@ -0,0 +1,141 @@
++"""Instruction fingerprint — a session follows changed instructions on its next turn.
++
++A session's system prompt is built once and reused on every later turn (prefix cache), from memory while
++the agent is cached and from the stored snapshot after that. Without this a changed SOUL.md, profile
++config.yaml or shared instruction file only reached NEW sessions; long-lived chat threads and desktop
++sessions kept the rules they started with.
++
++Every built prompt ends with a stamp ``[Instructieversie <fp>]``, where ``<fp>`` hashes the current
++contents of ``<home>/SOUL.md``, the extra files of ``agent.instruction_fingerprint_files`` (paths
++relative to the Hermes root, e.g. a shared ``team/TEAM.md``) and ``<home>/config.yaml``. A prompt whose stamp
++differs from the current fingerprint (or that has no stamp: built before this patch, when a SOUL.md
++exists) is stale: the stored snapshot is not reused and a cached prompt is dropped before the next turn, so that turn rebuilds and
++persists the prompt once (one prefix-cache miss per instruction change). Unchanged files keep the
++fingerprint, so caching is unaffected. File reads are memoised on (mtime_ns, size).
++
++Opt-in: only active with ``agent.instruction_fingerprint: true`` in the agent's config.yaml, so upstream
++behaviour (and its tests) is unchanged when the key is absent.
++
++    agent:
++      instruction_fingerprint: true
++      instruction_fingerprint_files: [team/TEAM.md]   # optional
++"""
++from __future__ import annotations
++
++import hashlib
++import logging
++import re
++from pathlib import Path
++from typing import Any, Dict, Optional, Tuple
++
++logger = logging.getLogger(__name__)
++
++STAMP_PREFIX = "[Instructieversie "
++_STAMP_RE = re.compile(r"\[Instructieversie ([0-9a-f]{12})\]")
++_STAMP_NOTE = "Deze instructies gelden boven regels die eerder in dit gesprek staan."
++_STAMP_REREAD = " Heb je {names} eerder in dit gesprek gelezen, lees die dan opnieuw voordat je ze gebruikt."
++_cache: Dict[str, Tuple[Tuple[int, int], str]] = {}
++
++
++def _digest(path: Path) -> str:
++    try:
++        st = path.stat()
++    except OSError:
++        return "-"
++    key = (st.st_mtime_ns, st.st_size)
++    hit = _cache.get(str(path))
++    if hit and hit[0] == key:
++        return hit[1]
++    try:
++        value = hashlib.sha256(path.read_bytes()).hexdigest()
++    except OSError:
++        return "-"
++    _cache[str(path)] = (key, value)
++    return value
++
++
++def _agent_config() -> Dict[str, Any]:
++    from hermes_cli.config import load_config_readonly
++    agent = (load_config_readonly() or {}).get("agent")
++    return agent if isinstance(agent, dict) else {}
++
++
++def enabled() -> bool:
++    try:
++        return bool(_agent_config().get("instruction_fingerprint"))
++    except Exception:
++        return False
++
++
++def _extra_files() -> Tuple[Path, ...]:
++    """``agent.instruction_fingerprint_files``: extra instruction files (relative to the Hermes root)."""
++    from hermes_constants import get_default_hermes_root
++    try:
++        configured = _agent_config().get("instruction_fingerprint_files") or []
++    except Exception:
++        return ()
++    if isinstance(configured, str):
++        configured = [configured]
++    root = get_default_hermes_root()
++    return tuple(root / Path(str(p)).expanduser() for p in configured if str(p or "").strip())
++
++
++def instruction_files() -> Tuple[Path, ...]:
++    """SOUL.md first (its absence matters for legacy prompts), config.yaml last."""
++    from hermes_constants import get_hermes_home
++    home = get_hermes_home()
++    return (home / "SOUL.md", *_extra_files(), home / "config.yaml")
++
++
++def _stamp_note() -> str:
++    extra = instruction_files()[1:-1]
++    if not extra:
++        return _STAMP_NOTE
++    return _STAMP_NOTE + _STAMP_REREAD.format(names=", ".join(p.name for p in extra))
++
++
++def current_fingerprint() -> str:
++    joined = "|".join(_digest(p) for p in instruction_files())
++    return hashlib.sha256(joined.encode()).hexdigest()[:12]
++
++
++def stamp(prompt: str) -> str:
++    """Append the stamp to a freshly built prompt (at the very end: the cached prefix stays intact)."""
++    if not enabled():
++        return prompt
++    try:
++        fp = current_fingerprint()
++    except Exception:  # never break prompt building
++        logger.debug("instruction fingerprint unavailable", exc_info=True)
++        return prompt
++    return f"{prompt}\n\n{STAMP_PREFIX}{fp}] {_stamp_note()}"
++
++
++def stamped_fingerprint(prompt: Optional[str]) -> Optional[str]:
++    found = _STAMP_RE.findall(prompt or "")
++    return found[-1] if found else None
++
++
++def cached_is_stale(prompt: Optional[str]) -> bool:
++    """For an in-memory prompt: True only when it carries a stamp that differs from the current one."""
++    if not enabled():
++        return False
++    try:
++        found = stamped_fingerprint(prompt)
++        return bool(found) and found != current_fingerprint()
++    except Exception:
++        return False
++
++
++def is_current(prompt: Optional[str]) -> bool:
++    """False when the prompt was built from other instructions than the current ones (fail-open)."""
++    if not enabled():
++        return True
++    try:
++        found = stamped_fingerprint(prompt)
++        if found is None:  # snapshot from before this patch: stale whenever a real SOUL.md exists
++            return not instruction_files()[0].exists()
++        return found == current_fingerprint()
++    except Exception:
++        logger.debug("instruction fingerprint check failed; keeping prompt", exc_info=True)
++        return True
+diff --git a/agent/system_prompt.py b/agent/system_prompt.py
+index 9d5c5e1ecc..7505a4c8ab 100644
+--- a/agent/system_prompt.py
++++ b/agent/system_prompt.py
+@@ -728,7 +728,9 @@ def build_system_prompt(agent: Any, system_message: Optional[str] = None) -> str
+     # Surface context-file truncation warnings in chat, not only in logs.
+     for warning in drain_truncation_warnings():
+         agent._emit_diagnostic_status(warning)
+-    return "\n\n".join(p for p in (parts["stable"], parts["context"], parts["volatile"]) if p)
++    # Stamp the instruction fingerprint (opt-in) last, after the volatile tier.
++    from agent.instruction_fingerprint import stamp
++    return stamp("\n\n".join(p for p in (parts["stable"], parts["context"], parts["volatile"]) if p))
+ 
+ 
+ def invalidate_system_prompt(agent: Any) -> None:
+diff --git a/agent/turn_context.py b/agent/turn_context.py
+index 3492e7f186..cb658a0e19 100644
+--- a/agent/turn_context.py
++++ b/agent/turn_context.py
+@@ -1017,6 +1017,16 @@ def build_turn_context(
+             f"{'...' if len(_preview_text) > 60 else ''}'"
+         )
+ 
++    # Instruction fingerprint (opt-in): a cached agent (gateway agent cache, open desktop session) whose prompt was built
++    # from older instructions drops it, so this turn restores-or-rebuilds with the current ones.
++    # Only stamped prompts are compared here; an unstamped one was restored by the restore check below.
++    if agent._cached_system_prompt is not None:
++        from agent.instruction_fingerprint import cached_is_stale
++        if cached_is_stale(agent._cached_system_prompt):
++            logger.info("Instructions changed since the cached system prompt of session %s; rebuilding.",
++                        getattr(agent, "session_id", "?"))
++            agent._invalidate_system_prompt()
++
+     # System prompt is cached per session for prefix caching.
+     if agent._cached_system_prompt is None:
+         restore_or_build_system_prompt(agent, system_message, conversation_history)
+diff --git a/tests/agent/test_instruction_fingerprint.py b/tests/agent/test_instruction_fingerprint.py
+new file mode 100644
+index 0000000000..cf2ca4f789
+--- /dev/null
++++ b/tests/agent/test_instruction_fingerprint.py
+@@ -0,0 +1,131 @@
++"""Instruction fingerprint: a changed SOUL.md / extra instruction file / config.yaml reaches existing sessions on their next turn."""
++from __future__ import annotations
++
++import os
++import time
++from unittest.mock import MagicMock
++
++import pytest
++
++from agent import instruction_fingerprint as fpmod
++from agent.conversation_loop import _restore_or_build_system_prompt
++
++
++@pytest.fixture()
++def home(tmp_path, monkeypatch):
++    root = tmp_path / "hermes"
++    (root / "team").mkdir(parents=True)
++    (root / "SOUL.md").write_text("# Manager\nRegel A.\n")
++    (root / "team" / "TEAM.md").write_text("# Teamafspraken\n")
++    (root / "config.yaml").write_text("model: {}\n")
++    monkeypatch.setattr(fpmod, "enabled", lambda: True)
++    monkeypatch.setattr(fpmod, "instruction_files",
++                        lambda: (root / "SOUL.md", root / "team" / "TEAM.md", root / "config.yaml"))
++    fpmod._cache.clear()
++    return root
++
++
++def _touch(path, text):
++    path.write_text(text)
++    later = time.time() + 5  # a different mtime even on coarse filesystems
++    os.utime(path, (later, later))
++
++
++def test_stamp_is_current_until_an_instruction_file_changes(home):
++    prompt = fpmod.stamp("BODY")
++    assert prompt.startswith("BODY\n\n[Instructieversie ")
++    assert fpmod.is_current(prompt)
++    for name, text in (("SOUL.md", "# Manager\nRegel B.\n"), ("team/TEAM.md", "# Nieuw\n"), ("config.yaml", "x: 1\n")):
++        _touch(home / name, text)
++        assert not fpmod.is_current(prompt), name
++        prompt = fpmod.stamp("BODY")
++        assert fpmod.is_current(prompt), name
++
++
++def test_unchanged_content_keeps_the_fingerprint(home):
++    before = fpmod.current_fingerprint()
++    _touch(home / "SOUL.md", (home / "SOUL.md").read_text())  # same bytes, new mtime
++    assert fpmod.current_fingerprint() == before
++
++
++def test_legacy_prompt_without_stamp_is_stale_when_a_soul_exists(home):
++    assert not fpmod.is_current("OLD PROMPT")
++    (home / "SOUL.md").unlink()
++    assert fpmod.is_current("OLD PROMPT")
++
++
++def _agent(stored):
++    db = MagicMock()
++    db.get_session.return_value = {"system_prompt": stored}
++    agent = MagicMock()
++    agent._cached_system_prompt = None
++    agent.session_id = "s1"
++    agent.model = "test-model"
++    agent.provider = "openrouter"
++    agent.platform = "discord"
++    agent._session_db = db
++    agent._use_prompt_caching = False
++    agent._persist_disabled = False
++    agent._platform_hint_overrides = None
++    agent._surface_switch_note = ""
++    agent._gateway_turn_context_notes = ""
++    agent._build_system_prompt = MagicMock(side_effect=lambda _m=None: fpmod.stamp("NEW BODY"))
++    return agent
++
++
++def test_restore_reuses_a_current_snapshot(home):
++    stored = fpmod.stamp("STORED BODY")
++    agent = _agent(stored)
++    _restore_or_build_system_prompt(agent, None, [{"role": "user", "content": "hi"}])
++    assert agent._cached_system_prompt == stored
++    agent._build_system_prompt.assert_not_called()
++
++
++def test_restore_rebuilds_after_a_soul_change_and_keeps_the_conversation(home):
++    stored = fpmod.stamp("STORED BODY")
++    _touch(home / "SOUL.md", "# Manager\nNieuwe regel.\n")
++    agent = _agent(stored)
++    history = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hallo"}]
++    _restore_or_build_system_prompt(agent, None, history)
++    agent._build_system_prompt.assert_called_once()
++    assert agent._cached_system_prompt.startswith("NEW BODY")
++    assert fpmod.is_current(agent._cached_system_prompt)
++    agent._session_db.update_system_prompt.assert_called_once_with("s1", agent._cached_system_prompt)
++    assert history[1]["content"] == "hallo"  # history is untouched
++
++
++def test_restore_rebuilds_a_legacy_snapshot(home):
++    agent = _agent("OLD PROMPT WITHOUT STAMP")
++    _restore_or_build_system_prompt(agent, None, [{"role": "user", "content": "hi"}])
++    agent._build_system_prompt.assert_called_once()
++
++
++def test_cached_prompt_check_only_compares_stamped_prompts(home):
++    prompt = fpmod.stamp("BODY")
++    assert not fpmod.cached_is_stale(prompt)
++    assert not fpmod.cached_is_stale("LEGACY WITHOUT STAMP")
++    _touch(home / "SOUL.md", "# Manager\nAnders.\n")
++    assert fpmod.cached_is_stale(prompt)
++
++
++def test_disabled_is_upstream_behaviour(home, monkeypatch):
++    monkeypatch.setattr(fpmod, "enabled", lambda: False)
++    assert fpmod.stamp("BODY") == "BODY"
++    assert fpmod.is_current("OLD PROMPT")
++    assert not fpmod.cached_is_stale("BODY [Instructieversie 000000000000]")
++
++
++def test_extra_instruction_files_come_from_config(tmp_path, monkeypatch):
++    root = tmp_path / "hermes"
++    (root / "team").mkdir(parents=True)
++    monkeypatch.setenv("HERMES_HOME", str(root))
++    monkeypatch.setattr(fpmod, "_agent_config", lambda: {
++        "instruction_fingerprint": True, "instruction_fingerprint_files": ["team/TEAM.md"]})
++    files = fpmod.instruction_files()
++    assert [p.name for p in files] == ["SOUL.md", "TEAM.md", "config.yaml"]
++    assert files[1].resolve() == (root / "team" / "TEAM.md").resolve()
++    assert "Heb je TEAM.md eerder in dit gesprek gelezen" in fpmod.stamp("BODY")
++
++    monkeypatch.setattr(fpmod, "_agent_config", lambda: {"instruction_fingerprint": True})
++    assert [p.name for p in fpmod.instruction_files()] == ["SOUL.md", "config.yaml"]
++    assert "Heb je" not in fpmod.stamp("BODY")

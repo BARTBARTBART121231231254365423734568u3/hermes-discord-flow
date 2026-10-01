@@ -1,0 +1,50 @@
+# Discord-deel van ~/.hermes/config.yaml (Hermes 0.21.4 + de verplichte patches).
+# Neem dit over in je eigen config.yaml en vervang de plaatshouders door de ID's uit ~/.hermes/team/discord.json
+# (CHATLOG_ID = "chatlog", VRAGEN_ID = "vragen", OWNER_ID = "owner"). Daarna de gateway herstarten.
+
+discord:
+  require_mention: false
+  # De manager antwoordt zonder @-vermelding in #chatlog en in de posts van #vragen; geen extra threads.
+  free_response_channels: <CHATLOG_ID>,<VRAGEN_ID>
+  allowed_channels: <CHATLOG_ID>,<VRAGEN_ID>
+  no_thread_channels: <CHATLOG_ID>,<VRAGEN_ID>
+  # Patch "vraagknoppen": alleen dit account mag een knop klikken of "Anders…" invullen (kommagescheiden voor meer).
+  decision_owner_id: '<OWNER_ID>'
+  # Naam in de teksten: "Antwoord van <naam> (knop): …", "Alleen <naam> kan deze vraag beantwoorden." Gebruik dezelfde
+  # naam als eigenaar.naam in flow.yaml (en in de instructies voor de manager).
+  question_owner_label: de eigenaar
+  # Labels in #vragen; gelijk aan discord.tags in flow.yaml.
+  question_tags: {open: open, beantwoord: beantwoord, verwerkt: verwerkt}
+  # Optioneel: het bord waarop de knop controleert of de vraag nog openstaat (standaard: alle borden).
+  # question_board: team
+  # Patch "self-improvement-melding": de 💾-melding na het leren niet in Discord posten (het leren blijft aan).
+  suppress_self_improvement_notice: true
+
+# Alleen jij mag met de bot praten.
+DISCORD_ALLOWED_USERS: '<OWNER_ID>'
+DISCORD_ALLOWED_CHANNELS: <CHATLOG_ID>,<VRAGEN_ID>
+DISCORD_FREE_RESPONSE_CHANNELS: <CHATLOG_ID>,<VRAGEN_ID>
+
+# Geen voortgangsmeldingen van tools in Discord.
+display:
+  platforms:
+    discord:
+      tool_progress: 'off'
+      interim_assistant_messages: false
+      long_running_notifications: false
+      busy_ack_detail: false
+      busy_steer_ack_enabled: false
+
+platforms:
+  discord:
+    enabled: true
+    home_channel:            # #chatlog: hier praat je met de manager
+      platform: discord
+      chat_id: '<CHATLOG_ID>'
+      name: chatlog
+      user_id: '<OWNER_ID>'
+    gateway_restart_notification: false   # geen eigen online/offline-berichten van de gateway
+
+# Kanban-routinemeldingen ("👀 ready for review", "✔ done") niet in Discord; de flow meldt zelf wat telt.
+kanban:
+  auto_subscribe_on_create: false

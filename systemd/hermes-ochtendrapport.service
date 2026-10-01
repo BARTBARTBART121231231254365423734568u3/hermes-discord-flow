@@ -1,0 +1,6 @@
+[Unit]
+Description=Hermes: ochtendrapport van de workflowkant (WORKFLOW → #ochtendrapport)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 %h/.hermes/scripts/hermes-ochtendrapport.py

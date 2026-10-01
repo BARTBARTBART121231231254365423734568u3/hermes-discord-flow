@@ -1,0 +1,6 @@
+[Unit]
+Description=Hermes: nachtelijke nieuwe #chatlog-sessie met overdracht (chatlog-rotate.py)
+
+[Service]
+Type=oneshot
+ExecStart=@HERMES_PYTHON@ %h/.hermes/scripts/chatlog-rotate.py

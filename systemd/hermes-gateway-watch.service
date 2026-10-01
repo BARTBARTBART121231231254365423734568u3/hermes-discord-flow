@@ -1,0 +1,6 @@
+[Unit]
+Description=Hermes gateway-wachter: onverwachte herstart of uitval melden in #meldingen
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 %h/.hermes/scripts/gateway-watch.py

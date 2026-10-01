@@ -1,0 +1,90 @@
+From e885b907646ee491cf8b7e8a382e71dafc261ea8 Mon Sep 17 00:00:00 2001
+From: Hermes Discord Flow <noreply@example.invalid>
+Date: Thu, 1 Oct 2026 08:50:11 +0000
+Subject: [PATCH 4/4] =?UTF-8?q?discord:=20=F0=9F=92=BE-melding=20van=20de?=
+ =?UTF-8?q?=20self-improvement=20review=20optioneel=20uit=20Discord?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Na een beurt kan de achtergrondreview een melding als "💾 Self-improvement
+review: …" of "💾 Skill '…' updated." in het kanaal of de forumpost zetten.
+In een vragenforum is dat ruis tussen vraag en antwoord.
+
+Met platforms.discord.suppress_self_improvement_notice: true (komt in extra)
+stuurt send() zo'n melding niet meer naar Discord en meldt het een geslaagde,
+onderdrukte verzending (raw_response {"suppressed":
+"self_improvement_notice"}). Het leren zelf blijft aan; alle andere berichten
+gaan ongewijzigd. Zonder de sleutel is het gedrag gelijk aan upstream.
+
+Tests: tests/gateway/test_discord_self_improvement_notice.py
+---
+ plugins/platforms/discord/adapter.py          |  5 +++
+ .../test_discord_self_improvement_notice.py   | 42 +++++++++++++++++++
+ 2 files changed, 47 insertions(+)
+ create mode 100644 tests/gateway/test_discord_self_improvement_notice.py
+
+diff --git a/plugins/platforms/discord/adapter.py b/plugins/platforms/discord/adapter.py
+index ccc0c83533..2204306374 100644
+--- a/plugins/platforms/discord/adapter.py
++++ b/plugins/platforms/discord/adapter.py
+@@ -2991,6 +2991,11 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
+     ) -> SendResult:
+         """Send a message to a Discord channel or thread (metadata thread_id wins over
+         chat_id; forum channels auto-create a thread post since they reject direct sends)."""
++        if self.config.extra.get("suppress_self_improvement_notice") and any(
++                pattern.match(content or "") for pattern in _DISCORD_NONCONVERSATIONAL_HISTORY_MESSAGE_PATTERNS[:2]):
++            # Opt-in: the background review keeps learning; only its "💾 Self-improvement review" /
++            # "💾 Skill '…' updated" notice stays out of Discord.
++            return SendResult(success=True, raw_response={"suppressed": "self_improvement_notice"})
+         if not self._client:
+             # Dead transport: classify as send_path_degraded so the delivery ledger's reconnect
+             # sweep can replay this; a generic "Not connected" error would strand the output.
+diff --git a/tests/gateway/test_discord_self_improvement_notice.py b/tests/gateway/test_discord_self_improvement_notice.py
+new file mode 100644
+index 0000000000..f853c6f680
+--- /dev/null
++++ b/tests/gateway/test_discord_self_improvement_notice.py
+@@ -0,0 +1,42 @@
++"""Opt-in ``suppress_self_improvement_notice``: the "💾 Self-improvement review" notice of the
++background review is not sent to Discord; every other message is sent as before."""
++
++from __future__ import annotations
++
++import asyncio
++
++import pytest
++
++from gateway.config import PlatformConfig
++from plugins.platforms.discord.adapter import DiscordAdapter
++
++NOTICES = [
++    "💾 Self-improvement review: saved a note about the build command",
++    "💾 Skill 'deploy-check' updated.",
++]
++
++
++def _send(adapter: DiscordAdapter, content: str):
++    return asyncio.run(adapter.send("123", content))
++
++
++def _adapter(**extra) -> DiscordAdapter:
++    # No client: an unsuppressed send ends in "send_path_degraded" before any network use.
++    return DiscordAdapter(PlatformConfig(enabled=True, token="***", extra=extra))
++
++
++@pytest.mark.parametrize("content", NOTICES)
++def test_notice_is_suppressed_when_enabled(content):
++    result = _send(_adapter(suppress_self_improvement_notice=True), content)
++    assert result.success is True
++    assert result.raw_response == {"suppressed": "self_improvement_notice"}
++
++
++@pytest.mark.parametrize("content", NOTICES)
++def test_notice_is_sent_by_default(content):
++    assert _send(_adapter(), content).error == "send_path_degraded"
++
++
++@pytest.mark.parametrize("content", ["Klaar: de tests zijn groen. 💾", "Self-improvement review: zonder icoon"])
++def test_other_messages_are_never_suppressed(content):
++    assert _send(_adapter(suppress_self_improvement_notice=True), content).error == "send_path_degraded"
