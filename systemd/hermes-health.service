@@ -5,5 +5,7 @@ After=network-online.target
 [Service]
 Type=oneshot
 ExecStart=/usr/bin/python3 %h/.hermes/scripts/hermes-health.py
-TimeoutStartSec=180
+# Workflow-inbox in Discord (Extra) na elke gezondheidscheck; een fout laat de check niet mislukken
+ExecStartPost=-/usr/bin/python3 %h/.hermes/scripts/workflow-inbox.py sync
+TimeoutStartSec=300
 Nice=10

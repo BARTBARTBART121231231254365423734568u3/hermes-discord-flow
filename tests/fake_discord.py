@@ -137,6 +137,13 @@ def route(method, path, query, body):  # noqa: C901 (one small router)
         if rest == "/messages" and method == "GET":
             limit = int(query.get("limit", ["50"])[0])
             return 200, list(reversed(STATE["messages"].get(cid, [])))[:limit]
+        m3 = re.fullmatch(r"/messages/(\w+)/reactions/([^/]+)/@me", rest)
+        if m3 and method == "PUT":
+            msg = next((x for x in STATE["messages"].get(cid, []) if x["id"] == m3.group(1)), None)
+            if msg is None:
+                return err(404, 10008, "Unknown Message")
+            msg.setdefault("reactions", []).append(m3.group(2))
+            return 204, None
         m2 = re.fullmatch(r"/messages/(\w+)", rest)
         if m2:
             msg = next((x for x in STATE["messages"].get(cid, []) if x["id"] == m2.group(1)), None)

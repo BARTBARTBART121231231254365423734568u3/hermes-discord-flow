@@ -1,0 +1,22 @@
+#!/bin/sh
+# hermes-testdb <commando…>: draait <commando> met DATABASE_URL naar een eigen wegwerpdatabase (pg_virtualenv).
+# Voorbeeld voor hermes-discord-flow: zet hem bijv. in ~/.hermes/bin/ en noem in kleurplaten alleen
+# `~/.hermes/bin/hermes-testdb pnpm verify`. Bouwers nemen dan nooit een commando met inloggegevens over
+# (de redactie van tooluitvoer toont een wachtwoord als ***). Vereist pg_virtualenv (pakket postgresql-common).
+# Stopt direct, zonder in te loggen, als de verbinding leeg is of *** bevat.
+set -eu
+if [ $# -eq 0 ]; then
+  echo "gebruik: hermes-testdb <commando…>   bijvoorbeeld: hermes-testdb pnpm verify" >&2
+  exit 2
+fi
+case "${DATABASE_URL:-}" in
+  *'***'*) echo "hermes-testdb: DATABASE_URL bevat *** (een weggelakt wachtwoord uit eerdere uitvoer). Niet overnemen; gebruik alleen: hermes-testdb <commando>" >&2
+           exit 2 ;;
+esac
+exec pg_virtualenv -t -- sh -c '
+  case "${PGPASSWORD:-}" in ""|*"***"*) echo "hermes-testdb: pg_virtualenv gaf geen geldig wachtwoord; test gestopt zonder in te loggen" >&2; exit 2;; esac
+  if [ -z "${PGUSER:-}" ] || [ -z "${PGPORT:-}" ] || [ -z "${PGDATABASE:-}" ]; then
+    echo "hermes-testdb: pg_virtualenv gaf geen volledige verbinding; test gestopt zonder in te loggen" >&2; exit 2
+  fi
+  url="postgres://${PGUSER}:"; url="${url}${PGPASSWORD}"; url="${url}@localhost:${PGPORT}/${PGDATABASE}"
+  DATABASE_URL="$url" exec "$@"' hermes-testdb "$@"

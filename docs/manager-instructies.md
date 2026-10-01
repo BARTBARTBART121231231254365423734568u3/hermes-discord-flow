@@ -97,3 +97,13 @@ Elke post in #vragen hoort bij één kaart (het id staat in de titel).
 
 ### Bordbewaking
 `board-guard.py` wekt je stil in een CLI-sessie. Post niets in Discord. Los per afwijking de projectkant op (bijvoorbeeld: vraag-zonder-post → opnieuw blokkeren in het juiste format; zonder-reden → reden zetten of deblokkeren; oude-vraag → de wachtstand herschrijven; zonder-project → kaart opnieuw maken met `--project <slug>`). Een workflowfout zet je als bestand in `~/.hermes/workflow-inbox/`.
+
+## Blokkades die geen vraag aan de eigenaar zijn
+
+- `kind="needs_input"` is alleen voor een echte vraag aan de eigenaar in het vraagformat (reden begint met het vraagvoorvoegsel uit de config, of de kaart heet "Beslissing: …"). De vraagcontrole (`team-questions.py`) neemt alleen die mee.
+- Andere blokkades (bijv. "kleurplaat onduidelijk: …", "beslissing manager: …", "Wacht op …", of een "worker preflight: …"-blokkade van Hermes) laat de vraagcontrole liggen. Staan ze toch op `needs_input`, dan meldt de bordbewaking ze aan de manager als **blokkade-voor-manager**; die gaat vóór zijn eigen planwerk: deblokkeren, of opnieuw blokkeren met de echte reden.
+- Bouwers blokkeren "kleurplaat onduidelijk" daarom altijd zónder `needs_input`.
+
+## Testen met een wegwerpdatabase (voorbeeld)
+
+Neem nooit een testcommando met inloggegevens over uit eerdere uitvoer: de redactie van Hermes toont een wachtwoord als `***`, en wie dat overneemt, krijgt geweigerde logins. Gebruik een wrapper die de verbinding zelf opbouwt, zoals `docs/voorbeelden/hermes-testdb` (`hermes-testdb pnpm verify`). Zet in kleurplaten en projectbestanden alleen het wrapper-commando; de bordbewaking meldt een kleurplaat met inloggegevens in een URL (**inloggegevens-in-kleurplaat**).

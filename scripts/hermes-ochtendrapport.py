@@ -15,6 +15,7 @@ configured time zone); one message with one ping per day (owner decision 30-09).
 State: ~/.hermes/state/ochtendrapport.json (last report time, used for the "zelf opgelost" window).
 """
 import json
+import re
 import sys
 import time
 from datetime import date, datetime, timedelta
@@ -83,6 +84,16 @@ def self_fixed(since):
     return out
 
 
+def inbox_summary():
+    """One line: teksten.ochtendrapport.inbox_regel (X open, oldest date) or inbox_leeg."""
+    items = sorted(p.name for p in fc.path("workflow_inbox").glob("*.md") if p.name != "LEESMIJ.md")
+    if not items:
+        return fc.text("ochtendrapport.inbox_leeg")
+    m = re.match(r"(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})-", items[0])
+    oldest = f"{m.group(3)}-{m.group(2)} {m.group(4)}:{m.group(5)}" if m else items[0][:13]
+    return fc.text("ochtendrapport.inbox_regel", aantal=len(items), oudste=oldest)
+
+
 def inbox_lines():
     items = sorted(p for p in fc.path("workflow_inbox").glob("*.md") if p.name != "LEESMIJ.md")
     out = []
@@ -133,7 +144,7 @@ def main():
     fixed = self_fixed(float(state.get("last", now - 24 * 3600)))  # own fixes (opstart) and approved inbox steps (both modes)
     parts += ["", K["opgelost"]] + (fixed or ["- niets"])
     inbox = inbox_lines()
-    parts += ["", K["inbox"]] + (inbox or ["- geen"])
+    parts += ["", K["inbox"], inbox_summary()] + inbox
     if today.weekday() == 0:
         parts += ["", K["week"]] + week_overview(today)
     ask = modus.get("vraag_vanaf")

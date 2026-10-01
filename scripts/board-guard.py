@@ -14,6 +14,10 @@ when something is wrong. Checks the Team board for:
   verkeerd-maximum    a "te groot (N regels … max X)" block whose X is not the limit in the kleurplaat's "Maximale
                       grootte" line (the builder invented his own limit, 01-10)
   beslissing-manager  blocked with "beslissing manager" for more than 30 min
+  blokkade-voor-manager  blocked with needs_input but the reason is no owner question (e.g. "worker preflight: …");
+                      team-questions.py leaves it alone since 01-10, so the manager must solve it
+  inloggegevens-in-kleurplaat  an open card's body contains a credential pattern in a URL (":$PGPASSWORD@",
+                      ":***@"): builders copy it with the redacted *** (incident 01-10); use the test wrapper
   afhankelijkheid-zonder-reden  an open card waits on an open predecessor (task_links) without a line naming that
                       predecessor with the reason (TEAM.md "Afhankelijkheden"); not for review/-99/designer/security
                       cards or links from a plan/intake/decision card; cards created since DEPS_SINCE
@@ -103,10 +107,11 @@ MAX_LINES = re.compile(r"Maximale grootte[^\n]*?(\d{2,4})\s*regels", re.I)
 DEFAULT_MAX_LINES = int(D["kleurplaat_max_regels"])
 OVER_LIMIT = 1.2  # > 20% over the kleurplaat limit (TEAM.md "Maximale grootte vooraf")
 TOO_BIG = re.compile(r"te groot\s*\(\s*~?(\d{2,5})\s*regels?[^)]*?\bmax(?:imaal|imum)?\.?\s*~?(\d{2,5})", re.I)
-MANAGER_KINDS = {"kleurplaat-onduidelijk", "verkeerd-maximum", "beslissing-manager"}  # before his own plan work
+MANAGER_KINDS = {"kleurplaat-onduidelijk", "verkeerd-maximum", "beslissing-manager", "blokkade-voor-manager"}  # before his own plan work
 MANAGER_REWAKE = int(D["manager_opnieuw_wekken_min"] * 60)
 MANAGER_ESCALATE = int(D["manager_escalatie_uur"] * 3600)
 DECISION_WAIT = int(D["beslissing_manager_wacht_min"] * 60)
+CRED_IN_URL = re.compile(r"://\$?\{?\w+\}?:(?:\$\{?\w+\}?|\*\*\*)@")
 DEPS_SINCE = int(fc.get("bordbewaking.regels_sinds.afhankelijkheden") or 0)  # dependency-reason rule in force
 DEP_EXEMPT_ASSIGNEES = CHECKERS
 
@@ -315,6 +320,10 @@ def anomalies(now):
                 if not KLEURPLAAT.search(body) or PLACEHOLDER.search(body):
                     add("kleurplaat-ontbreekt", f"bouwkaart staat op {t['status']} zonder volledige kleurplaat; "
                         "schrijf nu de kleurplaat (edit --body)")
+            if CRED_IN_URL.search(t["body"] or ""):
+                add("inloggegevens-in-kleurplaat", "de kleurplaat bevat een commando met inloggegevens in een URL "
+                    "(bijv. ':$PGPASSWORD@'); bouwers nemen dat over als '***'. Vervang het door het wrapper-commando uit "
+                    "het projectbestand (bijv. `~/.hermes/bin/hermes-testdb pnpm verify`) met edit --body")
             missing = dependency_checks(conn, t, title) if t["status"] in ("todo", "ready", "blocked") else []
             if missing:
                 add("afhankelijkheid-zonder-reden", f"wacht op {', '.join(missing)} zonder reden op de kaart; zet per "
@@ -357,6 +366,11 @@ def anomalies(now):
                     if run and (run["summary"] or "").strip().lower().startswith(PREFIX):
                         add("oude-vraag", "bord toont nog een beantwoorde vraag; herschrijf de wachtstand "
                             "(kanban_block met 'Wacht op …') zodat het bord de echte stand laat zien")
+                elif t["block_kind"] == "needs_input" and reason and not r.startswith(PREFIX) \
+                        and not title.lower().startswith("beslissing"):
+                    add("blokkade-voor-manager", "needs_input-blokkade die geen vraag aan de eigenaar is (gaat vóór je "
+                        f"planwerk): '{reason[:140]}'. Los het op: deblokkeer, of blokkeer opnieuw met de echte reden "
+                        "('beslissing manager: …' of 'Wacht op …'); alleen een echte vraag gaat in het vraagformat")
                 elif asks and not decision:
                     if now - since >= UNPOSTED_AFTER and not (ev and dp.event_seen(f"{t['id']}:vraag:{ev}")):
                         add("vraag-zonder-post", "geblokkeerd zonder needs_input of zonder geldige vraag"

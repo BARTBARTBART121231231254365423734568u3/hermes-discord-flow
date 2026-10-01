@@ -421,6 +421,50 @@ class Run:
             assert kop in m[-1]["content"], kop
         return "rapport met één ping in #ochtendrapport"
 
+    def s_inbox(self):
+        inbox = self.hh / "workflow-inbox"
+        inbox.mkdir(parents=True, exist_ok=True)
+        old = time.time() - 3600
+        item = inbox / "20261001-0900-voorbeeldpunt.md"
+        item.write_text("# Nieuwe timer voor de samenvatting\nWat: De samenvatting moet een uur later. Dat vraagt een "
+                        "nieuwe timer. Derde zin.\nWie vroeg het: manager\nSinds: 2026-10-01 09:00\n", encoding="utf-8")
+        secret = inbox / "20261001-0901-geheim.md"
+        secret.write_text("# Verbinding\nWat: postgres://gebruiker:ietsgeheims123@example.invalid/x\n"
+                          "Wie vroeg het: manager\n", encoding="utf-8")
+        for f in (item, secret):
+            os.utime(f, (old, old))
+        self.py("workflow-inbox.py", "sync")
+        m = self.messages("workflow-inbox")
+        assert len(m) == 2 and "Status: open" in m[0]["content"] and "Project: workflow" in m[0]["content"], m
+        assert "ietsgeheims123" not in m[1]["content"] and "niet getoond" in m[1]["content"], m[1]["content"]
+        self.py("workflow-inbox.py", "sync")
+        assert len(self.messages("workflow-inbox")) == 2, "tweede run plaatste opnieuw"
+        line = self.py("workflow-inbox.py", "status").stdout.strip()
+        assert line == "Workflow-inbox: 2 open (oudste: 01-10 09:00)", line
+        self.py("workflow-inbox.py", "afhandelen", item.name, "Timer aangepast (release 1).")
+        m = self.messages("workflow-inbox")
+        assert len(m) == 2 and m[0]["content"].startswith("~~**📥 Nieuwe timer") and "✅ Afgehandeld" in m[0]["content"]
+        assert m[0].get("edited") and m[0].get("reactions"), m[0]
+        assert (inbox / "afgehandeld" / item.name).exists() and not item.exists()
+        secret.unlink()
+        assert "Workflow-inbox: niets open" in self.py("hermes-ochtendrapport.py", "--dry-run").stdout
+        return "punt geplaatst (Status: open), geen dubbele, geheim verborgen; afgehandeld = zelfde bericht doorgestreept + ✅; ochtendrapportregel"
+
+    def s_vraagfilter(self):
+        kf.add_card(self.db, "t_00000f01", "Preflight-blokkade", status="blocked", assignee="coder", project_id=self.pid)
+        kf.block(self.db, "t_00000f01", "worker preflight: worktree branch does not contain repository HEAD",
+                 kind="needs_input", ago=600)
+        dry = self.py("team-questions.py", "--dry-run").stdout
+        assert "t_00000f01" not in dry, dry[-600:]
+        guard = self.py("board-guard.py", "--dry-run").stdout
+        assert "t_00000f01" in guard and "blokkade-voor-manager" in guard, guard[-600:]
+        import sqlite3
+        conn = sqlite3.connect(self.db)
+        conn.execute("UPDATE tasks SET status = 'archived' WHERE id = 't_00000f01'")
+        conn.commit()
+        conn.close()
+        return "needs_input zonder vraag: vraagcontrole laat hem liggen, bordbewaking meldt blokkade-voor-manager"
+
     def s_gezondheid(self):
         leftover = "hermes-worker-kanban-t_cccc0001-run-77.scope loaded active running worker"
         self.gateway(active=False, invocation="inv1", restarts=0, scopes=[leftover])
@@ -523,7 +567,8 @@ def main(argv):
     try:
         run.prepare()
         for name in ("install", "setup", "cron", "vraag", "knop", "anders", "melding", "staging", "samenvatting",
-                     "ochtendrapport", "gezondheid", "release", "bordbewaking", "opruiming", "gateway", "privacy"):
+                     "ochtendrapport", "inbox", "gezondheid", "release", "bordbewaking", "vraagfilter", "opruiming",
+                     "gateway", "privacy"):
             run.step(name, getattr(run, f"s_{name}"))
         if opt("--hermes"):
             run.step("patches", lambda: run.s_patches(opt("--hermes"), opt("--pytest-python") or sys.executable,

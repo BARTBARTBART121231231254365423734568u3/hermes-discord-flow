@@ -90,6 +90,9 @@ DEFAULTS = {
                                         "'✅ opgelost'. Stil."},
             "releases": {"naam": "releases", "categorie": "workflow", "soort": "tekst", "id": "", "alleen_bot": True,
                          "onderwerp": "Eén regel per workflow-release (releasenummer en wat er veranderde). Stil."},
+            "workflow-inbox": {"naam": "workflow-inbox", "categorie": "workflow", "soort": "tekst", "id": "",
+                               "alleen_bot": True,
+                               "onderwerp": "Workflow-inbox: één bericht per punt; doorgestreept = afgehandeld. Stil."},
             "regels": {"naam": "regels", "categorie": "systeem", "soort": "tekst", "id": "", "alleen_bot": False,
                        "onderwerp": "Serverregels (nodig voor Community)."},
             "moderator-updates": {"naam": "moderator-updates", "categorie": "systeem", "soort": "tekst", "id": "",
@@ -220,10 +223,21 @@ DEFAULTS = {
                          "is nu automatisch weer aangezet. Kaarten worden weer opgepakt. Je hoeft niets te doen; de "
                          "workflowkant kijkt waarom de herstart niet afrondde.",
         "release": "🚀 {nr} — {notitie} (regressie {score} OK)",
+        "workflow_inbox": {
+            "kop": "**📥 {titel}**",
+            "regel": "Project: {project} · Gemeld door: {wie} · {datum}",
+            "open": "Status: open",
+            "afgehandeld": "✅ Afgehandeld {wanneer}: {oplossing}",
+            "verborgen": "(inhoud niet getoond: bevat mogelijk een geheim)",
+            "geen_oplossing": "zie het bestand",
+            "geen_project": "workflow",
+        },
         "ochtendrapport": {
             "kop": "**Ochtendrapport workflow {datum}** (modus: {modus})",
             "koppen": {"gezondheid": "**Gezondheid**", "nacht": "**Nacht**", "opgelost": "**Uitgevoerd / zelf opgelost**",
                        "inbox": "**Open workflowpunten**", "week": "**Week (incidentenlogboek)**"},
+            "inbox_regel": "Workflow-inbox: {aantal} open (oudste: {oudste})",
+            "inbox_leeg": "Workflow-inbox: niets open",
             "modusvraag": "❓ Beslissing in de ops-sessie: op {tot} overschakelen naar rapportmodus, of de "
                           "opstartmodus verlengen?",
             "voorstellen": {

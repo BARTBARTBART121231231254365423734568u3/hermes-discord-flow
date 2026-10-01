@@ -36,6 +36,7 @@ Vink af in deze volgorde. Lukt een stap niet, stop dan en stuur terug wat ondera
 - [ ] `python3 ~/.hermes/scripts/discord_post.py meldingen "Testmelding"` geeft een ping in #meldingen.
 - [ ] `python3 ~/.hermes/scripts/staging-announce.py --dry-run` geeft geen fout (een echte staging-regel volgt bij de eerste gemergde kaart).
 - [ ] Extra's aan: `python3 ~/.hermes/scripts/hermes-ochtendrapport.py --dry-run` werkt, en **de volgende ochtend** staat het ochtendrapport in #ochtendrapport.
+- [ ] Extra workflow-inbox: #workflow-inbox bestaat (na `discord_setup.py`); een testpunt in de inbox geeft na `workflow-inbox.py sync` één bericht met "Status: open", en `workflow-inbox.py afhandelen <bestand> "test"` streept het door met ✅.
 
 ## Als iets niet lukt, stuur dit terug
 1. Welke stap, en wat je zag (een schermafbeelding van Discord mag).

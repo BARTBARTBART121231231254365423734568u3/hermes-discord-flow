@@ -14,5 +14,29 @@ Discord en het kanbanbord zijn alleen voor projecten. Ziet de manager een workfl
   Akkoord eigenaar: <het antwoord uit #vragen, letterlijk> (kaart <id>, <datum>)   ← alleen bij een serverstap
   ```
 - Alleen toevoegen; bestaande bestanden niet wijzigen of weghalen.
+- De velden `Wat:`, `Wie vroeg het:` en de titel (`# …`) worden gebruikt voor het bericht in Discord; houd ze kort en zonder geheimen (geen wachtwoorden, tokens of URL's met inloggegevens).
 
-Wie de workflow beheert, leest deze map regelmatig (het ochtendrapport en `team-status.py` tonen de open punten) en verplaatst een afgehandeld punt naar `afgehandeld/` met een regel "Afgehandeld: <datum> — <wat>".
+## In Discord: #workflow-inbox (Extra)
+
+`workflow-inbox.py sync` (draait na elke gezondheidscheck) zet elk nieuw punt als één stil bericht in WORKFLOW → #workflow-inbox: titel, 2–3 zinnen uit `Wat:`, project (een slug uit `projecten` in de config, anders "workflow"), wie het meldde, datum, bestandsnaam en "Status: open". Bestanden die minder dan een minuut oud zijn, wachten tot de volgende run (de manager kan nog schrijven).
+
+De status staat in het bestand zelf. Het script zet bovenaan een blok:
+```
+---
+status: "open"
+discord_message_id: "…"
+discord_status: "open"
+gepost_op: "2026-10-01T12:00+02:00"
+---
+```
+Laat dat blok staan. Daardoor plaatst het script nooit iets dubbel, ook niet als het opnieuw draait.
+
+**Afhandelen** doet wie de workflow beheert:
+```
+python3 ~/.hermes/scripts/workflow-inbox.py afhandelen <bestand> "<wat er is gedaan, met commit of release>"
+```
+Dat bewerkt hetzelfde bericht (titel en tekst doorgestreept, daaronder "✅ Afgehandeld <datum tijd>: <oplossing>", plus een ✅-reactie) en verplaatst het bestand naar `afgehandeld/`. Een bestand dat met de hand naar `afgehandeld/` is verplaatst, met een regel "Afgehandeld: <datum> — <wat>", wordt bij de volgende run ook doorgestreept geplaatst.
+
+**Geheimen:** elk bericht gaat eerst door een redactie (inloggegevens in URL's, tokens, lange sleutels, alle waarden uit de `.env`-bestanden). Vindt die iets, dan bevat het bericht alleen de titel en de bestandsnaam.
+
+Het ochtendrapport toont één regel: "Workflow-inbox: X open (oudste: <datum>)" of "Workflow-inbox: niets open".

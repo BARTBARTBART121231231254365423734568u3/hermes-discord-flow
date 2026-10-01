@@ -122,6 +122,15 @@ discord:
       id: ""
       alleen_bot: true
       onderwerp: Eén regel per workflow-release (releasenummer en wat er veranderde). Stil.
+    # Workflow-inbox (Extra): één stil bericht per punt in paden.workflow_inbox; afgehandeld = doorgestreept.
+    # discord_setup.py maakt dit kanaal aan zodra het hier staat; laat het weg als je geen inbox gebruikt.
+    workflow-inbox:
+      naam: workflow-inbox
+      categorie: workflow
+      soort: tekst
+      id: ""
+      alleen_bot: true
+      onderwerp: "Workflow-inbox: één bericht per punt; doorgestreept = afgehandeld. Stil."
     regels:
       naam: regels
       categorie: systeem
@@ -287,6 +296,17 @@ teksten:
     status_regel: "⏸️ DRAIN ACTIEF sinds {sinds}, tot uiterlijk {tot}: geplande herstart door de workflowkant. Er starten even geen nieuwe kaarten; lopend werk gaat door. Dit is GEEN storing: niet melden."
   drain_vangnet: "⚠️ Vangnet drain: de dispatcher stond sinds {sinds} op pauze voor een geplande herstart, en is nu automatisch weer aangezet. Kaarten worden weer opgepakt. Je hoeft niets te doen; de workflowkant kijkt waarom de herstart niet afrondde."
   release: "🚀 {nr} — {notitie} (regressie {score} OK)"
+  # workflow-inbox.py: berichten in #workflow-inbox. {titel}, {project}, {wie}, {datum}, {wanneer}, {oplossing}.
+  workflow_inbox:
+    kop: "**📥 {titel}**"
+    regel: "Project: {project} · Gemeld door: {wie} · {datum}"
+    open: "Status: open"
+    afgehandeld: "✅ Afgehandeld {wanneer}: {oplossing}"
+    # Vindt de redactie iets wat op een geheim lijkt, dan blijft het bij titel, deze regel en de bestandsnaam.
+    verborgen: "(inhoud niet getoond: bevat mogelijk een geheim)"
+    geen_oplossing: zie het bestand
+    # Project als geen enkele slug uit 'projecten' in het punt voorkomt.
+    geen_project: workflow
   ochtendrapport:
     kop: "**Ochtendrapport workflow {datum}** (modus: {modus})"
     koppen:
@@ -295,6 +315,9 @@ teksten:
       opgelost: "**Uitgevoerd / zelf opgelost**"
       inbox: "**Open workflowpunten**"
       week: "**Week (incidentenlogboek)**"
+    # Eén regel boven de open punten: aantal open en de datum van het oudste punt.
+    inbox_regel: "Workflow-inbox: {aantal} open (oudste: {oudste})"
+    inbox_leeg: "Workflow-inbox: niets open"
     modusvraag: "❓ Beslissing in de ops-sessie: op {tot} overschakelen naar rapportmodus, of de opstartmodus verlengen?"
     voorstellen:
       # In rapportmodus: het voorgestelde herstel per falende controle.

@@ -53,9 +53,22 @@ stateDiagram-v2
 | **WORKFLOW → #ochtendrapport** | tekst | 1 ping per dag | Gezondheid, de nachtcontrole, wat er zelf is opgelost en de open workflowpunten; op maandag het weekoverzicht van je incidentenlog. | `hermes-ochtendrapport.py` (07:30) |
 | **WORKFLOW → #gezondheid** | tekst | stil | Gezondheidsmeldingen die het projectwerk **niet** stilleggen (schijf, geheugen, git, staging, werkmappen …). Wordt "✅ opgelost". Legt een storing het werk wél stil (gateway, dispatcher, database), dan gaat hij naar #meldingen. | `hermes-health.py` (elk half uur) |
 | **WORKFLOW → #releases** | tekst | stil | Eén regel per workflow-release, alleen als de controle groen is. | `hermes-release.py --notitie "…"` |
+| **WORKFLOW → #workflow-inbox** | tekst | stil | Eén bericht per punt in de workflow-inbox met "Status: open"; afgehandeld = hetzelfde bericht doorgestreept met "✅ Afgehandeld …". | `workflow-inbox.py` (na elke gezondheidscheck) |
 | — | — | — | **Bordbewaking**: zoekt afwijkingen op het bord (vraag zonder post, blokkade zonder reden, kaart zonder project, …) en wekt de manager stil. Staat het er na 6 uur nog, dan één melding in #meldingen. | `board-guard.py` (elk half uur) |
 | — | — | — | **Opruiming en groeicontrole**: werkmappen en git-worktrees van afgeronde kaarten gaan weg (eerst gearchiveerd als er iets in staat); de gezondheidscheck meldt als ze te groot worden. | `clean_kanban_workspaces.py`, `werkmap_groei.py` |
+| — | — | — | **Vraagcontrole alleen voor echte vragen**: `team-questions.py` neemt alleen `needs_input`-blokkades mee die met het vraagvoorvoegsel beginnen (of op een "Beslissing: …"-kaart staan). Andere `needs_input`-blokkades (bijv. "kleurplaat onduidelijk" of een preflight van Hermes) laat hij liggen; de bordbewaking meldt ze aan de manager als **blokkade-voor-manager**. | `team-questions.py`, `board-guard.py` |
 | — | — | — | **Status per vraag**: `team-status.py` toont per project de open kaarten met hun reden van nu, en of een vraag "BEANTWOORD, WORDT VERWERKT" is. De manager gebruikt dit voor elk statusoverzicht. | `team-status.py` |
+
+#### Workflow-inbox
+
+De manager werkt nooit zelf aan de workflow (scripts, config, cron, server). Ziet hij daar een probleem of krijgt hij zo'n opdracht, dan schrijft hij één bestand per punt in de workflow-inbox (`paden.workflow_inbox`, standaard `~/.hermes/workflow-inbox/`). Het formaat staat in [`docs/workflow-inbox-LEESMIJ.md`](docs/workflow-inbox-LEESMIJ.md): een titel, `Wat:`, `Waarom:`, `Wie vroeg het:` en `Sinds:`.
+
+- `workflow-inbox.py sync` zet elk nieuw punt als één stil bericht in #workflow-inbox, met "Status: open". De status staat in het bestand zelf (een blok bovenaan), dus opnieuw draaien plaatst nooit iets dubbel. Elk bericht gaat eerst door een redactie; vindt die iets wat op een geheim lijkt, dan staan alleen de titel en de bestandsnaam erin.
+- Klaar? `workflow-inbox.py afhandelen <bestand> "<wat er is gedaan>"` streept hetzelfde bericht door, zet er "✅ Afgehandeld <datum tijd>: …" onder met een ✅-reactie, en verplaatst het bestand naar `afgehandeld/`.
+- Het ochtendrapport toont één regel: "Workflow-inbox: X open (oudste: <datum>)" of "Workflow-inbox: niets open".
+- **Kanaal aanmaken:** het staat standaard in de config (`discord.kanalen.workflow-inbox`, categorie WORKFLOW, alleen de bot). Draai `python3 ~/.hermes/scripts/discord_setup.py` (eerst met `--dry-run`): die maakt het kanaal aan als het nog niet bestaat en zet het ID in `team/discord.json`. Wil je geen inbox, haal het kanaal dan uit je config. `install.sh` laat de sync meedraaien na de gezondheidscheck (`ExecStartPost` in `hermes-health.service`).
+
+Voorbeeld voor testen met een wegwerpdatabase: [`docs/voorbeelden/hermes-testdb`](docs/voorbeelden/hermes-testdb) bouwt de databaseverbinding zelf op (`hermes-testdb pnpm verify`), zodat een bouwer nooit een commando met inloggegevens overneemt uit uitvoer waarin het wachtwoord als `***` staat. De bordbewaking meldt kleurplaten met inloggegevens in een URL (**inloggegevens-in-kleurplaat**).
 
 Optioneel: `drain-restart.py` (de gateway veilig herstarten: eerst geen nieuwe kaarten, wachten tot er 0 workers lopen) en `chatlog-rotate.py` (elke nacht een nieuwe #chatlog-sessie met een korte overdracht; `install.sh --met-chatlog`).
 
@@ -76,6 +89,7 @@ flowchart LR
       H[hermes-health.py]
       O[hermes-ochtendrapport.py]
       R[hermes-release.py]
+      I[workflow-inbox.py]
     end
     subgraph Discord
       V["#vragen (forum)"]
@@ -85,6 +99,7 @@ flowchart LR
       OR["#ochtendrapport"]
       GZ["#gezondheid"]
       RE["#releases"]
+      WI["#workflow-inbox"]
     end
     B --> Q --> V
     V -- "knop / Anders…" --> G --> M --> B
@@ -100,6 +115,7 @@ flowchart LR
     H -- "werk ligt stil" --> ME
     O --> OR
     R --> RE
+    M -- "workflowpunt (bestand)" --> I --> WI
 ```
 
 Alle namen, teksten, tijden en drempels staan in één config: [`config.example.yaml`](config.example.yaml) (met uitleg per veld). Je eigen versie staat op `~/.hermes/team/flow.yaml` en gaat nooit in git.
@@ -164,6 +180,7 @@ Doe deze tests na de installatie, in deze volgorde. Wat je hoort te zien, staat 
 8. **Gezondheid** (extra). `python3 ~/.hermes/scripts/hermes-health.py --dry-run` toont alle controles en wat hij zou posten.
 9. **Release** (extra). `python3 ~/.hermes/scripts/hermes-release.py --notitie "eerste installatie"` geeft één regel in #releases als de controle groen is.
 10. **Bordbewaking** (extra). `python3 ~/.hermes/scripts/board-guard.py --dry-run` eindigt met "0 afwijking(en)" op een leeg bord.
+11. **Workflow-inbox** (extra). Zet een testbestand `JJJJMMDD-HHMM-test.md` in de workflow-inbox (formaat uit de LEESMIJ), wacht een minuut en draai `python3 ~/.hermes/scripts/workflow-inbox.py sync`: één bericht met "Status: open" in #workflow-inbox. Daarna `workflow-inbox.py afhandelen <bestand> "test"`: hetzelfde bericht wordt doorgestreept met ✅.
 
 De automatische versie van deze lijst, met een nep-Discord en zonder echte gegevens: `python3 tests/clean_install_test.py` (zie [Bestanden](#bestanden)).
 

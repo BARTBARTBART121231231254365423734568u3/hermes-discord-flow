@@ -16,8 +16,10 @@ advice only: nothing happens until the owner clicks. Details go in a second mess
 Validation: a question without ≥2 complete options, without exactly one recommendation or without the
 "Waarom deze aanbeveling" block (incl. when another option is better) is NOT posted; it goes back to
 the sender: a comment on the card lists what is missing, and the card is unblocked to its assignee
-(a card without assignee goes to the manager profile "default"). A needs_input reason without the
-prefix is treated the same way. ``--check`` validates a reason from stdin (exit 1 + what is missing).
+(a card without assignee goes to the manager profile "default"). Only real owner questions are handled here
+(owner decision 01-10): a needs_input block whose reason does NOT start with the prefix (e.g. "kleurplaat
+onduidelijk: …", "worker preflight: …") is left alone, except on a "Beslissing: …" card; board-guard.py reports
+it to the manager ("blokkade-voor-manager"). ``--check`` validates a reason from stdin (exit 1 + what is missing).
 
 One post per card: a new question on the same card (new block event) is posted as a new message in the
 existing post, which is reopened and tagged open again. Every question has a button "✏️ Anders…" that opens
@@ -74,6 +76,8 @@ def open_questions():
             except (ValueError, TypeError):
                 reason = ""
             asked = reason.strip().lower().startswith(PREFIX)
+            if not asked and not (t["title"] or "").lower().startswith("beslissing"):
+                continue  # not a question for the owner: the board guard hands it to the manager (no bounce)
             found.append({"id": t["id"], "title": t["title"], "project": slug, "assignee": t["assignee"],
                           "project_name": projects[slug]["name"], "board": board, "asked": asked,
                           "question": reason.strip()[len(PREFIX):].strip() if asked else reason.strip(),
