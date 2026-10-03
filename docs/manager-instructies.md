@@ -106,3 +106,4 @@ Elke post in #vragen hoort bij één kaart (het id staat in de titel).
 ## Testen met een wegwerpdatabase (voorbeeld)
 
 Neem nooit een testcommando met inloggegevens over uit eerdere uitvoer: de redactie van Hermes toont een wachtwoord als `***`, en wie dat overneemt, krijgt geweigerde logins. Gebruik een wrapper die de verbinding zelf opbouwt, zoals `docs/voorbeelden/hermes-testdb` (`hermes-testdb pnpm verify`). Zet in kleurplaten en projectbestanden alleen het wrapper-commando; de bordbewaking meldt een kleurplaat met inloggegevens in een URL (**inloggegevens-in-kleurplaat**).
+- **Plan in weinig beurten:** bedenk eerst alle kaarten van een portie, maak ze daarna in één of twee beurten met parallelle `kanban_create`-aanroepen; controleer met één `kanban_list`/`kanban_show`. Richtlijn: een planrun ≤ 30 calls (elke beurt kost denkwerk en limiet).
