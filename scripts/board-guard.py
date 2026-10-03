@@ -411,6 +411,11 @@ def block_rule(conn, blocked, specific, waits, now, add):
             continue
         if item and (INBOX / f"{item.group(1)}.md").exists():
             continue  # the workflow side has the item open: that is progress
+        ids = [x for x in re.findall(r"\bt_[0-9a-f]{8}\b", reason) if x != i]  # inbox 2110: wacht op een kaart die klaar is
+        if r.startswith("wacht op") and ids and all((conn.execute("SELECT status FROM tasks WHERE id = ?", (x,)).fetchone()
+                                                      or ["?"])[0] in ("done", "archived") for x in ids):
+            unblocks.append((i, f"Bordbewaking: {', '.join(ids)} is klaar; de kaart gaat verder."))
+            continue
         age = now - b["since"]
         if appointment(reason, now):
             continue  # waits on an agreed date that has not passed yet (owner 03-10)
