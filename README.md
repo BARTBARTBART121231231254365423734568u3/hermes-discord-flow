@@ -33,16 +33,15 @@ De flow heeft twee lagen. Begin met de **basis**; de **extra's** kun je later aa
 2. Binnen 2 minuten staat de vraag als post in #vragen, met een ping. Een vraag zonder opties, zonder advies of met een serverpad wordt **niet** gepost; de kaart gaat met een commentaar terug naar de afzender.
 3. Jij klikt een knop, gebruikt **Anders…**, of typt in de post. Alleen jouw account telt (`owner_id`).
 4. De manager zet je antwoord letterlijk op de kaart ("Antwoord van …"), en de kaart gaat verder, of wacht op iets anders met een reden "Wacht op …". Een wachtstand is geen vraag en komt niet in #vragen.
-5. Is de kaart klaar, dan krijgt de post het label **verwerkt** en wordt hij gesloten.
+5. Een beantwoorde post gaat meteen naar het archief (niet vergrendeld). Een post die nog open is als de kaart klaar is, krijgt het label **verwerkt** en wordt gesloten. Een script schrijft nooit in een gearchiveerde post: een nieuwe vraag op dezelfde kaart wordt een nieuwe post.
 
 ```mermaid
 stateDiagram-v2
     [*] --> open: kaart geblokkeerd (needs_input, format geldig)
     [*] --> terug: format onvolledig → commentaar + terug naar afzender
     open --> beantwoord: knop / Anders… / kaart verder
-    beantwoord --> open: nieuwe vraag op dezelfde kaart (zelfde post)
-    beantwoord --> verwerkt: kaart done of gearchiveerd
-    open --> verwerkt: kaart gearchiveerd
+    beantwoord --> [*]: post gearchiveerd (nieuwe vraag = nieuwe post)
+    open --> verwerkt: kaart done of gearchiveerd
     verwerkt --> [*]: post gesloten en vergrendeld
 ```
 

@@ -13,7 +13,7 @@ README test list and checks every Discord call in the fake's log:
                  a second run creates nothing
   cron           install.sh creates the Hermes cron jobs (samenvatting to #samenvatting); a second run none
   vraag          a valid question → forum post with tags, ⭐ button first, "Anders…"; an incomplete one goes back
-  knop           simulated click (what the patched gateway does) → beantwoord; manager unblocks; card done → verwerkt
+  knop           simulated click (what the patched gateway does) → beantwoord + archived (not locked); card done → the archived post stays untouched
   anders         simulated "Anders…" answer + "Wacht op …" wait state → beantwoord, no new post; team-status
   melding        discord_post.py meldingen with ping; board-guard.py: a block wakes the manager (no message), a
                  failed card → one "kaart mislukt" with ping, never twice, resolved later
@@ -325,12 +325,14 @@ class Run:
         kf.set_status(self.db, "t_aaaa0001", "done", completed=True)
         self.py("team-questions.py")
         self.py("discord-cleanup.py")
+        # since 03-10 a script never edits an archived post: beantwoord archives it at once (not locked) and the
+        # cleanup leaves it as it is when the card is done (the test still expected the old verwerkt + lock)
         t = self.state()["channels"][self.thread1["id"]]
-        assert self.tag_names(t) == ["Demo", "verwerkt"], self.tag_names(t)
-        assert t["thread_metadata"]["archived"] and t["thread_metadata"]["locked"]
+        assert self.tag_names(t) == ["Demo", "beantwoord"], self.tag_names(t)
+        assert t["thread_metadata"]["archived"] and not t["thread_metadata"].get("locked")
         content = self.state()["messages"][t["id"]][0]["content"]
         assert "✅ **Gekozen:** ⭐ 1 · Groen" in content
-        return "klik → beantwoord; kaart done → verwerkt, gearchiveerd en vergrendeld"
+        return "klik → beantwoord en gearchiveerd; kaart done → post onaangeroerd"
 
     def s_anders(self):
         kf.add_card(self.db, "t_aaaa0003", "Beslissing: lettertype", status="todo", project_id=self.pid)
