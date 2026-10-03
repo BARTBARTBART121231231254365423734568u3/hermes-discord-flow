@@ -299,23 +299,23 @@ def project_checks(projects, open_cards, intake_done, work=None, capacity=None, 
     for slug, p in projects.items():
         cards = open_cards.get(slug, [])
         title = f"Project {p['name']} ({p['status']})"
+        txt = p["file"].read_text(encoding="utf-8", errors="replace")
         s = (supply or {}).get(slug) or {}
         if p["status"] == "ACTIEF" and s.get("n", 0) < SUPPLY_MIN and s.get("plan") and not s.get("busy"):
             found.append({"id": f"project:{slug}", "title": title, "project": slug, "kind": "voorraad-laag",
                           "why": f"nog {s.get('n', 0)} coderkaart(en) klaar of startbaar (minimaal {SUPPLY_MIN}); plan nu "
                                  f"de eerstvolgende {SUPPLY_MIN} bouwkaarten (met volledige kleurplaat, zonder de -00 als "
                                  "voorganger); niet wachten tot de hele fase gepland is"})
-        if p["status"] == "GEPAUZEERD" and ("f0-done", slug) in intake_done and not EXPLICIT_PAUSE.search(
-                p["file"].read_text(encoding="utf-8", errors="replace")):
+        if p["status"] == "GEPAUZEERD" and ("f0-done", slug) in intake_done and not EXPLICIT_PAUSE.search(txt):
             found.append({"id": f"project:{slug}", "title": title, "project": slug, "kind": "akkoord-zonder-actief",
                           "why": "het fasenplan (F0-00) is af en goedgekeurd, maar het project staat nog op GEPAUZEERD; "
                                  "zet STATUS: ACTIEF en maak de kaarten van het eerste blok (incl. -99)"})
         if (p["status"] == "ACTIEF" and capacity and capacity.get("free") and not (work or {}).get(slug)
-                and not NO_NEXT_STEP.search(p["file"].read_text(encoding="utf-8", errors="replace"))):
+                and not NO_NEXT_STEP.search(txt)):
             found.append({"id": f"project:{slug}", "title": title, "project": slug, "kind": "stilstaande-capaciteit",
                           "why": "een coderplek is al 30 min vrij en dit project heeft geen kaart in ready/running/review; "
                                  "zet het volgende werk uit het goedgekeurde fasenplan klaar (zonder opnieuw te vragen)"})
-        if not cards and not NO_NEXT_STEP.search(p["file"].read_text(encoding="utf-8", errors="replace")):
+        if not cards and not NO_NEXT_STEP.search(txt):
             found.append({"id": f"project:{slug}", "title": title, "project": slug, "kind": "project-zonder-stap",
                           "why": "geen open kaart en geen open vraag in #vragen; niemand werkt eraan. Maak de "
                                  f"volgende kaart (na een intake: 'F0-00 Fasenplan schrijven + akkoord {OWNER}')"})
@@ -324,6 +324,12 @@ def project_checks(projects, open_cards, intake_done, work=None, capacity=None, 
             found.append({"id": f"project:{slug}", "title": title, "project": slug, "kind": "geen-fasenplan",
                           "why": "intake is afgerond, maar docs/PHASES.md ontbreekt en geen kaart schrijft hem; "
                                  f"maak 'F0-00 Fasenplan schrijven + akkoord {OWNER}'"})
+        if (p["status"] == "ACTIEF" or ("f0-done", slug) in intake_done) and not fc.is_set(
+                (fc.projects().get(slug) or {}).get("verify")) and not any("verify" in c.lower() for c in cards) \
+                and not any(INBOX.glob(f"*verify*{slug}*.md")):  # besluit eigenaar 03-10: elk project een verify vóór bouwen
+            found.append({"id": f"project:{slug}", "title": title, "project": slug, "kind": "geen-verify",
+                          "why": "geen verify-opdracht (nachtcontrole slaat het project over); maak 'F0-01 Verify-opdracht "
+                                 f"(build + lint + tests)' en zet na afloop het commando in een inboxpunt '<datum>-verify-{slug}.md'"})
     return found
 
 
