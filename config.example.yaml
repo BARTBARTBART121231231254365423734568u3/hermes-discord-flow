@@ -304,14 +304,12 @@ teksten:
     melding: "⚠️ {label}: {detail} (sinds {sinds})"                                   # naar #gezondheid (stil)
   gateway:
     onverwacht: "⚠️ Gateway onverwacht herstart: {waarom}. Weer online sinds {sinds}."
-    weer_online: "🟢 Gateway weer online (sinds {sinds})."
     plat: "🔴 Gateway ligt plat sinds {sinds} (status {status}). Hermes reageert niet."
   # {host} {vrij} {totaal} {procent} {drempel} (getallen; :.1f is de opmaak)
   schijf: "⚠️ Weinig schijfruimte op {host}: nog {vrij:.1f} GB vrij van {totaal:.0f} GB ({procent:.0f}% in gebruik) — drempel is {drempel:.0f} GB. Maak ruimte vrij of breid de disk uit."
   drain:
-    # drain-restart.py in #gezondheid ({sinds} {tot} {reden}) en de regel bovenaan team-status.py ({sinds} {tot})
+    # drain-restart.py in #gezondheid ({sinds} {tot}; bij het einde "✅ opgelost") en de regel bovenaan team-status.py
     actief: "⏸️ Drain actief sinds {sinds}, tot uiterlijk {tot} (geplande gateway-herstart): er starten even geen nieuwe kaarten; lopend werk gaat door. Geen storing."
-    klaar: "▶️ Drain klaar ({reden}): de dispatcher pakt weer kaarten op."
     status_regel: "⏸️ DRAIN ACTIEF sinds {sinds}, tot uiterlijk {tot}: geplande herstart door de workflowkant. Er starten even geen nieuwe kaarten; lopend werk gaat door. Dit is GEEN storing: niet melden."
   drain_vangnet: "⚠️ Vangnet drain: de dispatcher stond sinds {sinds} op pauze voor een geplande herstart, en is nu automatisch weer aangezet. Kaarten worden weer opgepakt. Je hoeft niets te doen; de workflowkant kijkt waarom de herstart niet afrondde."
   release: "🚀 {nr} — {notitie} (regressie {score} OK)"

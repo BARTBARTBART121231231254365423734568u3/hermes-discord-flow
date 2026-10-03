@@ -219,7 +219,6 @@ DEFAULTS = {
         },
         "gateway": {
             "onverwacht": "⚠️ Gateway onverwacht herstart: {waarom}. Weer online sinds {sinds}.",
-            "weer_online": "🟢 Gateway weer online (sinds {sinds}).",
             "plat": "🔴 Gateway ligt plat sinds {sinds} (status {status}). Hermes reageert niet.",
         },
         "schijf": "⚠️ Weinig schijfruimte op {host}: nog {vrij:.1f} GB vrij van {totaal:.0f} GB ({procent:.0f}% in "
@@ -227,7 +226,6 @@ DEFAULTS = {
         "drain": {
             "actief": "⏸️ Drain actief sinds {sinds}, tot uiterlijk {tot} (geplande gateway-herstart): er starten even "
                       "geen nieuwe kaarten; lopend werk gaat door. Geen storing.",
-            "klaar": "▶️ Drain klaar ({reden}): de dispatcher pakt weer kaarten op.",
             "status_regel": "⏸️ DRAIN ACTIEF sinds {sinds}, tot uiterlijk {tot}: geplande herstart door de workflowkant. "
                             "Er starten even geen nieuwe kaarten; lopend werk gaat door. Dit is GEEN storing: niet melden.",
         },

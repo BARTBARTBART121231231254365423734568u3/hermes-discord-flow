@@ -38,7 +38,7 @@ Routing per failure episode (event register key "health:<check>:<since>", see di
 - BLOCKING → one message with ping in #meldingen;
 - everything else → one silent message in #gezondheid (channel key "gezondheid" in team/discord.json; when it
   does not exist yet only the log and the state file are written);
-- a check that is OK again: its message is edited to "✅ opgelost (HH:MM) — ~~…~~" and marked resolved.
+- a check that is OK again: its message is edited to "✅ opgelost (HH:MM) — ~~…~~" and marked resolved (dp.opgelost).
 Always writes ~/.hermes/state/health.json (per check: ok, detail, since, last_run) for the morning report, and
 ~/.hermes/state/zelfcontrole-nodig.json {"at", "reasons"} when a check fails or ~/.hermes/workflow-inbox/ has a
 *.md (not LEESMIJ.md) newer than the last ops check-in; that flag file is removed when nothing needs attention.
@@ -710,17 +710,10 @@ def route(results, now, dry=False) -> dict:
             since = old.get("since") if old.get("ok") else now
             if old and not old.get("ok") and not dry:
                 log(f"weer ok: {key}")
-            for ev_key, info in open_ev.items():
+            for ev_key in open_ev:
                 done["opgelost"].append(ev_key)
-                if dry or not info.get("message"):
-                    continue
-                text = re.sub(r"^<@\d+>\s*", "", info.get("text", ""))
-                try:
-                    dp.edit(info["channel"], info["message"], fc.text("opgelost", tijd=hhmm(now), tekst=text[:1800]))
-                except RuntimeError:
-                    pass  # message already gone
-                dp.event_mark(ev_key, resolved=now)
-                log(f"opgelost: {ev_key}")
+                if not dry and dp.opgelost(ev_key, now):
+                    log(f"opgelost: {ev_key}")
         else:
             if old and not old.get("ok"):
                 since = old.get("since") or now
@@ -740,9 +733,8 @@ def route(results, now, dry=False) -> dict:
                 elif dry:
                     done["gepost"].append(f"{'#meldingen (ping)' if r['blocking'] else '#gezondheid'}: {text}")
                 else:
-                    msg = dp.send(chan, text, ping=r["blocking"], silent=not r["blocking"])
-                    dp.event_mark(ev_key, message=msg["id"], channel=msg["channel_id"], text=msg["content"],
-                                  check=key, since=since)
+                    dp.meld("meldingen" if r["blocking"] else "gezondheid", ev_key, text, ping=r["blocking"],
+                            check=key, since=since)
                     done["gepost"].append(ev_key)
                     log(f"gepost ({'meldingen' if r['blocking'] else 'gezondheid'}): {ev_key}: {r['detail']}")
         checks[key] = {"ok": r["ok"], "detail": r["detail"], "since": since, "last_run": now,

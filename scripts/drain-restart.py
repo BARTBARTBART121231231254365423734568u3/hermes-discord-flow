@@ -28,8 +28,9 @@ workers finish, and only at 0 workers the gateway restarts. The dispatcher ALWAY
    is active and that the dispatcher claims again (a ready card starts, or no card was ready).
 ``--alleen-drain [--vangnet <duur>]``: alleen stap 1 en 2 (drain aan + vangnet, standaard 2h) en direct klaar,
 zonder te wachten en zonder herstart (migratie agent-gebruiker, Z-terug). Terugzetten met ``--restore``.
-Start and end of a drain are posted silently in WORKFLOW → #gezondheid ("drain actief sinds …, tot uiterlijk …"),
-so a paused dispatcher is not taken for a fault; team-status.py and hermes-health.py show the same.
+The start of a drain is posted silently in WORKFLOW → #gezondheid ("drain actief sinds …, tot uiterlijk …"), so a
+paused dispatcher is not taken for a fault; at the end that message is edited to "✅ opgelost (HH:MM) — …" (dp.meld /
+dp.opgelost, key "drain:<start>"). team-status.py and hermes-health.py show the same.
 Log: ~/.hermes/logs/drain-restart.log.
 ``--gepland [--scoped | --force]`` (voorheen gateway-planned-restart.sh): planned gateway restart (workflow side): refuses
 while kanban workers run, writes the marker so gateway-watch.py stays silent, then restarts. Workers run in their own
@@ -47,6 +48,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import discord_post as dp  # noqa: E402
 import flow_config as fc  # noqa: E402
 
 H = fc.HOME
@@ -156,14 +158,6 @@ def gepland(mode):
     return 0
 
 
-def gezondheid(text):
-    try:
-        import discord_post as dp
-        dp.send(dp.channels()["gezondheid"], text, ping=False)
-    except Exception as exc:  # noqa: BLE001 (a missing post never blocks the restart)
-        log(f"melding #gezondheid mislukt: {type(exc).__name__}")
-
-
 def hhmm(ts):
     return datetime.fromtimestamp(ts, NL).strftime("%H:%M")
 
@@ -230,10 +224,11 @@ def drain(max_wait=20 * 60):
         restore(reason="vangnet-timer kon niet worden gezet")
         raise SystemExit(f"vangnet-timer mislukt, drain teruggedraaid: {r.stderr.strip()[:200]}")
     log(f"DRAIN aan: dispatcher claimt niets meer (was: {original.strip()}); vangnet over {VANGNET}")
-    gezondheid(fc.text("drain.actief", sinds=hhmm(now), tot=hhmm(now + max_wait)))
+    dp.meld("gezondheid", f"drain:{int(now)}", fc.text("drain.actief", sinds=hhmm(now), tot=hhmm(now + max_wait)),
+            veilig=True)  # a missing post never blocks the restart
 
 
-def restore(failsafe=False, reason=""):
+def restore(failsafe=False, reason="", mislukt=False):
     if not STATE.exists():
         if not failsafe:
             print("geen drain actief")
@@ -245,10 +240,8 @@ def restore(failsafe=False, reason=""):
         subprocess.run(["systemctl", "--user", "stop", f"{TIMER}.timer"], capture_output=True)
     log(f"DRAIN uit: {info['line'].strip()} teruggezet" + (f" ({reason})" if reason else "")
         + (" door het vangnet" if failsafe else ""))
-    if not failsafe:
-        gezondheid(fc.text("drain.klaar", reden=reason or "teruggezet"))
+    dp.opgelost(f"drain:{int(info['at'])}", mislukt=reason if mislukt else None)  # mislukte herstart blijft zichtbaar
     if failsafe:
-        import discord_post as dp
         since = datetime.fromtimestamp(info["at"], NL).strftime("%H:%M")
         dp.send(dp.channels()["meldingen"], fc.text("drain_vangnet", sinds=since), ping=True)
     return True
@@ -348,7 +341,7 @@ def main():
             alive = {t: [x for x in p if Path(f"/proc/{x}").exists()] for t, p in pids.items()}
             log("lopende workers na de herstart: " + ", ".join(f"{t} {'leeft' if a else 'WEG'}" for t, a in alive.items()))
     finally:
-        restore(reason="na de herstart" if ok else "herstart niet gelukt")
+        restore(reason="na de herstart" if ok else "herstart niet gelukt", mislukt=not ok)
     time.sleep(20)
     active = subprocess.run(fc.systemctl_gateway("is-active", UNIT),
                             capture_output=True, text=True).stdout.strip()

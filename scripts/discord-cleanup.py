@@ -129,13 +129,7 @@ def resolve_messages(dry):
             continue
         resolved.append(key)
         if not dry:
-            text = re.sub(r"^<@\d+>\s*", "", info["text"])
-            stamp = datetime.now(fc.tz()).strftime("%H:%M")
-            try:
-                dp.edit(info["channel"], info["message"], fc.text("opgelost", tijd=stamp, tekst=text[:1800]))
-            except RuntimeError:
-                pass  # message already gone
-            dp.event_mark(key, resolved=time.time())
+            dp.opgelost(key)
     return resolved
 
 

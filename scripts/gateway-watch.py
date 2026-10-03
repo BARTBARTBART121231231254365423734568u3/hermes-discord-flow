@@ -3,7 +3,8 @@
 gateway, so it also works while the gateway is down). Posts to #meldingen with a ping only when:
 - the gateway restarted UNEXPECTEDLY (crash with automatic restart, server reboot, or stopped and
   started without a planned-restart marker);
-- the gateway has been down for more than 2 minutes (and once more when it is back).
+- the gateway has been down for more than 2 minutes; when it is back that message is edited to "✅ opgelost (HH:MM)
+  — …" (dp.opgelost, event key "gateway-plat:<down since>"; no new message, no ping).
 Planned restarts are silent: ``drain-restart.py --gepland`` writes the marker
 ~/.hermes/state/gateway-planned-restart.json first; a chat /restart leaves ~/.hermes/.restart_pending.json.
 The first run records the current state silently. State: ~/.hermes/state/gateway-watch.json.
@@ -58,10 +59,6 @@ def hhmm(ts: float) -> str:
     return datetime.fromtimestamp(ts, fc.tz()).strftime("%H:%M")
 
 
-def alert(text: str) -> None:
-    dp.send(dp.channels()["meldingen"], text, ping=True)
-
-
 def main():
     now = time.time()
     unit, boot = unit_state(), boot_id()
@@ -85,17 +82,19 @@ def main():
                     why = "hij crashte en systemd startte hem automatisch opnieuw"
                 else:
                     why = "hij stopte en startte zonder geplande herstart"
-                alert(fc.text("gateway.onverwacht", waarom=why, sinds=unit.get("ActiveEnterTimestamp", "?")))
-        elif prev.get("down_alerted"):
-            alert(fc.text("gateway.weer_online", sinds=unit.get("ActiveEnterTimestamp", "?")))
+                dp.send(dp.channels()["meldingen"], fc.text("gateway.onverwacht", waarom=why,
+                                                            sinds=unit.get("ActiveEnterTimestamp", "?")), ping=True)
+        if prev.get("down_alerted"):
+            dp.opgelost("gateway-plat:", now)
     else:
         cur["invocation"] = prev.get("invocation", "")
         cur["nrestarts"] = int(prev.get("nrestarts") or 0)
         cur["down_since"] = prev.get("down_since") or now
         cur["down_alerted"] = bool(prev.get("down_alerted"))
         if not cur["down_alerted"] and now - cur["down_since"] > DOWN_ALERT_AFTER and not planned(now):
-            alert(fc.text("gateway.plat", sinds=hhmm(cur["down_since"]),
-                          status=f"{unit.get('ActiveState')}/{unit.get('SubState')}"))
+            dp.meld("meldingen", f"gateway-plat:{int(cur['down_since'])}", fc.text(
+                "gateway.plat", sinds=hhmm(cur["down_since"]), status=f"{unit.get('ActiveState')}/{unit.get('SubState')}"),
+                ping=True)
             cur["down_alerted"] = True
     STATE.write_text(json.dumps(cur))
 

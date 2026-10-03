@@ -12,6 +12,7 @@ forum posts with a title, tags and buttons; silent messages (@silent); editing t
 
 CLI (for the workflow side):  discord_post.py meldingen "text"   → ping message in #meldingen
                               discord_post.py staging "text" --silent
+                              discord_post.py meld <kanaal> <sleutel> "text" [--ping] / opgelost <sleutel>
 """
 import json
 import os
@@ -206,6 +207,49 @@ def edit(channel_id: str, message_id: str, text: str) -> None:
         {"content": text[:MAX_CONTENT], "allowed_mentions": {"parse": []}})
 
 
+def meld(kanaal: str, sleutel: str, tekst: str, *, ping=False, veilig=False, **info):
+    """Automatic message that can resolve itself (rule owner 03-10): posted once per ``sleutel`` (the register key,
+    e.g. "<script>:<episode-start>") in #``kanaal``, silent unless ``ping``. ``veilig``: a failed post is printed,
+    never raised (a post must not block e.g. a drain). Returns the message, or None (already posted / failed)."""
+    try:
+        if event_seen(sleutel):
+            return None
+        msg = send(channels()[kanaal], tekst, ping=ping, silent=not ping)
+        event_mark(sleutel, message=msg["id"], channel=msg["channel_id"], text=msg["content"], **info)
+        return msg
+    except Exception as exc:  # noqa: BLE001
+        if not veilig:
+            raise
+        print(f"melding #{kanaal} mislukt: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return None
+
+
+def opgelost(sleutel: str, tijd=None, mislukt=None) -> list:
+    """Edit the message(s) of ``sleutel`` to "✅ opgelost (HH:MM NL-tijd) — ~~…~~" (no new message, no ping) and mark
+    them resolved; discord-cleanup.py removes them after the retention term. A key ending in ":" resolves every open
+    key with that prefix. Idempotent and never raises; returns the keys it resolved now."""
+    from datetime import datetime
+    tijd = tijd or time.time()
+    try:
+        open_ = {k: v for k, v in (events_matching(sleutel) if sleutel.endswith(":") else
+                                   {sleutel: event_get(sleutel)}).items() if v and not v.get("resolved")}
+        for key, info in open_.items():
+            if info.get("message"):
+                tekst = re.sub(r"^<@\d+>\s*", "", info.get("text", ""))[:1800]
+                try:
+                    hhmm = datetime.fromtimestamp(tijd, fc.tz()).strftime("%H:%M")  # mislukt: ⚠️ i.p.v. ✅ (blijft staan)
+                    edit(info["channel"], info["message"], f"⚠️ {mislukt} ({hhmm}) — {tekst}" if mislukt
+                         else fc.text("opgelost", tijd=hhmm, tekst=tekst))
+                except RuntimeError as exc:
+                    if "HTTP 404" not in str(exc):
+                        raise  # retry next time; a deleted message (404) counts as resolved
+            event_mark(key, resolved=tijd)
+        return list(open_)
+    except Exception as exc:  # noqa: BLE001
+        print(f"opgelost {sleutel} mislukt: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return []
+
+
 def reopen(thread_id: str, forum_id: str) -> None:
     """Unarchive + unlock a post and tag it open again (a new question on the same card)."""
     api("PATCH", f"/channels/{thread_id}", {"archived": False, "locked": False})
@@ -218,8 +262,15 @@ def thread_messages(thread_id: str, limit=50) -> list:
 
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    if args[:1] == ["meld"] and len(args) == 4:
+        meld(args[1], args[2], args[3], ping="--ping" in sys.argv)
+        return
+    if args[:1] == ["opgelost"] and len(args) == 2:
+        print(" ".join(opgelost(args[1])))
+        return
     if len(args) != 2:
-        sys.exit("gebruik: discord_post.py <meldingen|staging|samenvatting> <tekst> [--silent]")
+        sys.exit("gebruik: discord_post.py <kanaal uit discord.json, bv. meldingen of gezondheid> <tekst> [--silent]"
+                 " | meld <kanaal> <sleutel> <tekst> [--ping] | opgelost <sleutel of prefix:>")
     chan = channels()[args[0]]
     silent = "--silent" in sys.argv
     send(chan, args[1], ping=not silent and args[0] == "meldingen", silent=silent)
