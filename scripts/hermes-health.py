@@ -451,10 +451,10 @@ def probe_herstartlus(now=None):
 # Bewust van de ops-gebruiker (rechten-agent.sh, Z3) en ops-bestanden die zijn scripts schrijven (geen Hermes-code).
 # Was eigenaar-gate.sh --alleen-bestanden (blok A1 samengevoegd; de volledige overstap-gate staat in het archief).
 _EIGENAAR_PRUNE = ("scripts", "bin", "plugins", "hooks", "secrets", "workflow-inbox", "profiles/*/plugins",
-                   "profiles/*/hooks", "profiles/*/bin")
+                   "profiles/*/hooks", "profiles/*/bin", "team/templates")
 _EIGENAAR_PADEN = ("", ".env", "config.yaml", "SOUL.md", "hermes-agent", "team", "team/TEAM.md", "team/flow.yaml",
                    "team/discord.json", "team/workflow-modus.json", "team/kleurplaat-template.md",
-                   "team/task-template.md", "profiles")
+                   "team/task-template.md", "team/INTAKE.md", "team/vragenbank.md", "profiles")
 
 
 OPS_USER = pwd.getpwuid(os.getuid()).pw_name  # de ops-gebruiker: wie de gezondheidscheck draait (nooit de agent)

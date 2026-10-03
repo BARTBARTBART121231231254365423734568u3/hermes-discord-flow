@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Discord cleanup check (cron, --no-agent, every 10 min). Keeps the channels in step with the board:
 
-1. #vragen: every post (open or archived) whose card is done or archived gets the tag "verwerkt" and is
-   archived + locked, also when a later message reopened it. Posts of other cards are left alone.
+1. #vragen: every OPEN post whose card is done or archived gets the tag "verwerkt" and is archived + locked; an
+   archived post is never touched (owner decision 03-10). Then the open posts are counted (event "vragen-stand":
+   open, wacht, afgehandeld_open); afgehandeld_open > 0 or a failed round → #gezondheid, resolved by the next good round.
 2. Kanban notification subscriptions to Discord are removed: routine kanban messages ("👀 ready for review",
    "✔ done") stay out of Discord (kanban.auto_subscribe_on_create is off; this catches explicit ones).
    Failures reach #meldingen through board-guard.py.
@@ -11,8 +12,8 @@
 4. Bewaartermijnen (besluit eigenaar 03-10, flow-config opruimen.discord): berichten na hun termijn weg, ALTIJD eerst
    als JSON-regel in paden.discord_archief/<kanaal>/<jjjj-mm>.jsonl (map 700, bestand 600); pas na een geslaagde
    schrijfactie het DELETE. #chatlog/#staging/#samenvatting: alles na de termijn; #meldingen/#gezondheid: alleen
-   "✅ opgelost" (termijn vanaf de bewerking); #workflow-inbox: alleen doorgestreepte; #vragen: hele posts met de tag
-   verwerkt, termijn vanaf de archivering. Vastgepind blijft altijd. Een niet-opgeloste #meldingen-melding wordt nooit
+   "✅ opgelost" (termijn vanaf de bewerking); #workflow-inbox: alleen doorgestreepte; #vragen: gearchiveerde posts (kaart klaar
+   of zonder kaart-ID), termijn vanaf de archivering. Vastgepind blijft altijd. Een niet-opgeloste #meldingen-melding wordt nooit
    verwijderd; ouder dan melding_doorgeven_dagen gaat hij één keer naar de manager (event "melding-oud:<id>", dat
    board-guard.py als afwijking meeneemt in zijn wekker). Budget per ronde: max_per_ronde verwijderingen of
    max_seconden; de rest volgt de volgende ronde. Eén voor één (geen bulk-delete); een 429 met een lange
@@ -62,19 +63,13 @@ def forum_posts(forum):
 
 
 def close_done_posts(forum, dry):
-    tags = {t["name"].lower(): t["id"] for t in dp.api("GET", f"/channels/{forum}")["available_tags"]}
     fixed = []
     for t in forum_posts(forum):
         m = CARD_RE.search(t["name"])
-        if not m or card_status(m.group(0)) not in ("done", "archived"):
-            continue
-        md = t["thread_metadata"]
-        if md.get("archived") and md.get("locked") and tags.get(fc.tag("verwerkt").lower()) in t.get("applied_tags", []):
-            continue
+        if t["thread_metadata"].get("archived") or not m or card_status(m.group(0)) not in ("done", "archived"):
+            continue  # archived posts are left alone
         fixed.append(t["name"])
         if not dry:
-            if md.get("archived"):
-                dp.api("PATCH", f"/channels/{t['id']}", {"archived": False})
             dp.set_status(t["id"], forum, "verwerkt", close=True)
     return fixed
 
@@ -234,19 +229,37 @@ def candidates(key, channel, now, conf, limit=None, deadline=None):
     return gone, report
 
 
-def done_posts(forum, now, conf):
-    """Posts in #vragen met de tag verwerkt, gearchiveerd en langer dan de termijn geleden gearchiveerd."""
-    tags = {t["name"].lower(): t["id"] for t in dp.api("GET", f"/channels/{forum}")["available_tags"]}
-    verwerkt = tags.get(fc.tag("verwerkt").lower())
+def done_posts(forum, now, conf):  # gearchiveerd na de termijn; kaart klaar of geen kaart
     term = float(conf["termijnen_dagen"]["vragen"]) * DAG
     out = []
     for t in forum_posts(forum):
         md = t.get("thread_metadata") or {}
-        if not verwerkt or verwerkt not in t.get("applied_tags", []) or not md.get("archived") or t.get("flags", 0) & 2:
+        if not md.get("archived") or t.get("flags", 0) & 2:
             continue  # flags & 2 = vastgepinde post
-        if now - ts_of({"id": t["id"], "timestamp": md.get("archive_timestamp")}) > term:
+        card = CARD_RE.search(t["name"])
+        if now - ts_of({"id": t["id"], "timestamp": md.get("archive_timestamp")}) > term and \
+                (not card or card_status(card.group(0)) in ("done", "archived")):
             out.append(t)
     return out
+
+
+def vragen_stand(forum):  # (open, wacht, afgehandeld_open); afgehandeld: tag beantwoord/verwerkt, kaart klaar of geen kaart
+    names = {t["id"]: t["name"].lower() for t in dp.api("GET", f"/channels/{forum}")["available_tags"]}
+    n = m = a = 0
+    for t in forum_posts(forum):
+        if t["thread_metadata"].get("archived"):
+            continue
+        tags = {names.get(i) for i in t.get("applied_tags", [])}
+        card = CARD_RE.search(t["name"])
+        n, m = n + 1, m + (fc.tag("open").lower() in tags)
+        a += bool(tags & {fc.tag("beantwoord").lower(), fc.tag("verwerkt").lower()} or not card
+                  or card_status(card.group(0)) in ("done", "archived"))
+    return n, m, a
+
+
+def melding(naam, tekst):  # één open #gezondheid-melding per soort, nieuwe pas na "opgelost"
+    if not any(not v.get("resolved") for v in dp.events_matching(naam + ":").values()):
+        dp.meld("gezondheid", f"{naam}:{int(time.time())}", tekst, veilig=True)
 
 
 def retention(dry, now=None):
@@ -317,16 +330,37 @@ def retention(dry, now=None):
     return out, doorgegeven
 
 
+def ronde(forum, dry):
+    report = {"posts_gesloten": close_done_posts(forum, dry), "abonnementen_afgemeld": drop_discord_subscriptions(dry),
+              "meldingen_opgelost": resolve_messages(dry)}
+    report["bewaartermijnen"], report["meldingen_doorgegeven"] = retention(dry)
+    n, m, a = vragen_stand(forum)
+    if dry:
+        print(f"#vragen: {n} open, {m} wachten op {fc.owner_name()}, {a} afgehandeld maar nog open")
+        return report
+    dp.event_mark("vragen-stand", open=n, wacht=m, afgehandeld_open=a, bijgewerkt=time.time())
+    if a:
+        melding("vragen-afgehandeld-open", f"⚠️ #vragen: {a} van de {n} open posts zijn al afgehandeld "
+                f"(beantwoord/verwerkt, kaart klaar of zonder kaart); {m} wachten op {fc.owner_name()}")
+    else:
+        dp.opgelost("vragen-afgehandeld-open:")
+    return report
+
+
 def main():
     dry = "--dry-run" in sys.argv
     _lock = None if dry else dp.single_instance("discord-cleanup")  # noqa: F841 (held until exit; droog: geen lock)
     if "vragen" not in dp.channels():
         print("geen #vragen-kanaal ingesteld (draai eerst discord_setup.py); niets te controleren")
         return
-    forum = dp.channels()["vragen"]
-    report = {"posts_gesloten": close_done_posts(forum, dry), "abonnementen_afgemeld": drop_discord_subscriptions(dry),
-              "meldingen_opgelost": resolve_messages(dry)}
-    report["bewaartermijnen"], report["meldingen_doorgegeven"] = retention(dry)
+    try:
+        report = ronde(dp.channels()["vragen"], dry)
+    except Exception as exc:  # noqa: BLE001
+        if not dry:
+            melding("opruiming-fout", f"⚠️ discord-cleanup: ronde mislukt ({type(exc).__name__}: {str(exc)[:150]})")
+        raise
+    if not dry:
+        dp.opgelost("opruiming-fout:")
     if dry:
         print({k: v for k, v in report.items() if k != "bewaartermijnen"})
         for key, row in report["bewaartermijnen"].items():

@@ -22,15 +22,17 @@ onduidelijk: …", "worker preflight: …") is left alone, except on a "Beslissi
 it to the manager ("blokkade-voor-manager"). ``--check`` validates a reason from stdin (exit 1 + what is missing).
 
 One post per card: a new question on the same card (new block event) is posted as a new message in the
-existing post, which is reopened and tagged open again. Every question has a button "✏️ Anders…" that opens
-a text field (fork handler). Event keys "<kaart>:vraag:<blokkade-event>" in ~/.hermes/state/discord-events.json
-make sure a question is never posted twice. A reason starting with "Wacht op" is a wait status written by
-the manager after an answer (not a question) and is skipped; a new real question on a card that waits on a
-workflow run (flow config paden.workflow_waits) is posted normally.
+existing post while that is open (an archived or deleted post is never written in: new post, owner decision 03-10).
+Every question has a button "✏️ Anders…" that opens a text field (fork handler). Event keys
+"<kaart>:vraag:<blokkade-event>" in ~/.hermes/state/discord-events.json make sure a question is never posted
+twice. A reason starting with "Wacht op" is a wait status written by the manager after an answer (not a question)
+and is skipped; a new real question on a card that waits on a workflow run (flow config paden.workflow_waits) is
+posted normally.
 
 Status per post, checked every run: open → beantwoord (the owner clicked a button, or the card is no longer
-blocked on that question; typed text alone does not count, it may be a counter-question) → verwerkt, archived and locked once the card
-is done or archived (discord-cleanup.py re-checks every 10 minutes). State: questions-posts.json (per card).
+blocked on that question; typed text alone does not count, it may be a counter-question; archived at once, not locked)
+→ verwerkt + archived + locked once the card is done or archived, if still open (discord-cleanup.py re-checks every
+10 minutes). State: questions-posts.json (per card).
 
 ``--dry-run`` prints what would be posted or returned and records nothing.
 ``--advies <kaart> <n> "<waarom>"``: the team's advice changed → old buttons off, new message with ⭐ on option n.
@@ -214,13 +216,12 @@ def return_to_sender(q, missing):
 
 
 def post(q, forum):
-    """``(thread_id, question_message_id)``: a new post, or a new message in the card's existing post."""
+    """``(thread_id, question_message_id)``: a new post, or a new message in the card's existing open post."""
     content, details, components = layout(q)
     existing = (dp.event_get(f"{q['id']}:post") or {}).get("thread")
-    if existing:
+    if existing and not dp.is_archived(existing):  # an archived or deleted post gets a new post below
         try:
             retire_previous_questions(q["id"], existing)
-            dp.reopen(existing, forum)
             msg = dp.send(existing, content, ping=True, components=components)
             if details:
                 dp.send(existing, f"{T['details_kop']}\n{details}", silent=True)
@@ -264,10 +265,11 @@ def reconcile_one(p, still_open, forum, owner):
     """The post's state after this run, or None once it is verwerkt."""
     status = card_status(p["board"], p["task"])
     if status in ("done", "archived"):
-        remove_buttons(p, owner)
-        dp.set_status(p["thread"], forum, "verwerkt", close=True)
+        if not dp.is_archived(p["thread"]):  # an archived post stays as it is
+            remove_buttons(p, owner)
+            dp.set_status(p["thread"], forum, "verwerkt", close=True)
         return None
-    if p["status"] == "open":
+    if p["status"] == "open" and not dp.is_archived(p["thread"]):
         # Typed text alone is NOT an answer (owner decision 30-09): it can be a counter-question. The buttons stay until
         # the card leaves this question (unblocked, "Wacht op …", completed) or a button choice set "beantwoord".
         answered = p["episode"] not in still_open
@@ -276,8 +278,8 @@ def reconcile_one(p, still_open, forum, owner):
             tag_names = {t["id"]: t["name"].lower() for t in dp.api("GET", f"/channels/{forum}")["available_tags"]}
             answered = fc.tag("beantwoord").lower() in {tag_names.get(t) for t in thread.get("applied_tags", [])}
         if answered:
-            dp.set_status(p["thread"], forum, "beantwoord")
-            remove_buttons(p, owner)
+            remove_buttons(p, owner)  # before archiving: no edits in an archived post
+            dp.set_status(p["thread"], forum, "beantwoord", archive=True)
             p = {**p, "status": "beantwoord"}
     return p
 
@@ -349,21 +351,23 @@ def change_advice(card, choice, why):
     q = {**q, "question": "\n".join(lines)}
     content, _details, components = layout(q)
     forum, thread, old = dp.channels()["vragen"], info["thread"], info["message"]
-    try:
-        old_msg = dp.api("GET", f"/channels/{thread}/messages/{old}")
-        dp.api("PATCH", f"/channels/{thread}/messages/{old}",
-               {"content": (old_msg["content"][:1850] + "\n\n" + T["advies_gewijzigd"]),
-                "components": [], "allowed_mentions": {"parse": []}})
-    except RuntimeError:
-        pass  # old message gone: just post the new advice
-    dp.reopen(thread, forum)
-    msg = dp.send(thread, T["nieuw_advies"] + "\n" + content, ping=True, components=components)
-    dp.event_mark(f"{card}:vraag:{event}", thread=thread, message=msg["id"])
-    dp.event_mark(f"{card}:advies:{event}:{choice}:{msg['id']}", thread=thread, message=msg["id"])
+    if dp.is_archived(thread):  # owner decision 03-10: never write in an archived post (old message stays as is)
+        thread, new = post(q, forum)
+    else:
+        try:
+            old_msg = dp.api("GET", f"/channels/{thread}/messages/{old}")
+            dp.api("PATCH", f"/channels/{thread}/messages/{old}",
+                   {"content": (old_msg["content"][:1850] + "\n\n" + T["advies_gewijzigd"]),
+                    "components": [], "allowed_mentions": {"parse": []}})
+        except RuntimeError:
+            pass  # old message gone: just post the new advice
+        new = dp.send(thread, T["nieuw_advies"] + "\n" + content, ping=True, components=components)["id"]
+    dp.event_mark(f"{card}:vraag:{event}", thread=thread, message=new)
+    dp.event_mark(f"{card}:advies:{event}:{choice}:{new}", thread=thread, message=new)
     posts = json.loads(POSTS.read_text() or "{}") if POSTS.exists() else {}
     for k, v in posts.items():
         if v.get("task") == card:
-            posts[k] = {**v, "message": msg["id"], "status": "open"}
+            posts[k] = {**v, "thread": thread, "message": new, "status": "open"}
     POSTS.write_text(json.dumps(posts))
     subprocess.run([HERMES, "kanban", "--board", q["board"], "comment", "--author", "manager", card,
                     f"Advies gewijzigd naar optie {choice}: {why} (post bijgewerkt; oude knoppen uit)"],

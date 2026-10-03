@@ -67,6 +67,10 @@ def health_lines(mode):
     return out
 
 
+def vragen_lines():  # stand van discord-cleanup.py; zonder telling: geen regel
+    return [f"- #vragen: {v['open']} open, waarvan {v['wacht']} wachten op {fc.owner_name()}"] if (v := dp.event_get("vragen-stand")) else []
+
+
 def regression_lines():
     r = load(H / "state" / "regressie.json", None)
     if not r:
@@ -398,7 +402,7 @@ def main():
     state = load(STATE, {})
     K = T["koppen"]
     parts = [fc.text("ochtendrapport.kop", datum=f"{today:%d-%m}", modus=mode)]
-    parts += ["", K["gezondheid"]] + health_lines(mode)
+    parts += ["", K["gezondheid"]] + health_lines(mode) + vragen_lines()
     parts += ["", K["nacht"]] + regression_lines()
     teller, regels = teller_lines(load(STATE, {}).get("teller") or {})
     parts += ["", "**Opruimteller** (doel eind blok A)"] + regels

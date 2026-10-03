@@ -117,22 +117,26 @@ def forum_post(forum_id: str, title: str, text: str, tag_ids, *, ping=False, com
                {"name": title[:100], "applied_tags": list(tag_ids)[:5], "message": message})
 
 
-def set_status(thread_id: str, forum_id: str, status: str, *, close=False) -> None:
+def is_archived(thread_id: str) -> bool:
+    try:  # archived or gone: scripts never write in it (owner decision 03-10)
+        return bool(api("GET", f"/channels/{thread_id}").get("thread_metadata", {}).get("archived"))
+    except RuntimeError:
+        return True
+
+
+def set_status(thread_id: str, forum_id: str, status: str, *, close=False, archive=False) -> None:
     """Swap the status tag (status key open/beantwoord/verwerkt → its configured tag name), keep the project tag;
-    optionally archive + lock."""
+    optionally archive (``archive``) or archive + lock (``close``). An archived post is left alone: no unarchive,
+    no tag change (owner decision 03-10)."""
+    thread = api("GET", f"/channels/{thread_id}")
+    if thread.get("thread_metadata", {}).get("archived"):
+        return
     ids = ensure_tags(forum_id, STATUS_TAGS)
     status_ids = {ids[s.lower()] for s in STATUS_TAGS if s.lower() in ids}
-    thread = api("GET", f"/channels/{thread_id}")
-    md = thread.get("thread_metadata", {})
     keep = [t for t in thread.get("applied_tags", []) if t not in status_ids]
-    tags = (keep + [ids[fc.tag(status).lower()]])[:5]
-    if md.get("archived") and sorted(thread.get("applied_tags", [])) == sorted(tags) and (not close or md.get("locked")):
-        return  # already in the wanted state (e.g. closed by an earlier run)
-    if md.get("archived"):  # Discord refuses edits on an archived thread
-        api("PATCH", f"/channels/{thread_id}", {"archived": False})
-    body = {"applied_tags": tags}
-    if close:
-        body.update({"archived": True, "locked": True})
+    body = {"applied_tags": (keep + [ids[fc.tag(status).lower()]])[:5]}
+    if close or archive:
+        body.update({"archived": True, "locked": close})
     api("PATCH", f"/channels/{thread_id}", body)
 
 
@@ -248,12 +252,6 @@ def opgelost(sleutel: str, tijd=None, mislukt=None) -> list:
     except Exception as exc:  # noqa: BLE001
         print(f"opgelost {sleutel} mislukt: {type(exc).__name__}: {exc}", file=sys.stderr)
         return []
-
-
-def reopen(thread_id: str, forum_id: str) -> None:
-    """Unarchive + unlock a post and tag it open again (a new question on the same card)."""
-    api("PATCH", f"/channels/{thread_id}", {"archived": False, "locked": False})
-    set_status(thread_id, forum_id, "open")
 
 
 def thread_messages(thread_id: str, limit=50) -> list:
