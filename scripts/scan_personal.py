@@ -123,6 +123,10 @@ def local_terms():
                 terms[f.stem] = "projectbestand"
         for t in fc.get("export.prive_termen") or []:
             terms[str(t)] = "prive-term"
+        for f in (home / "team" / "deployments").glob("*.json"):  # Railway-ID's van elk project, zonder handwerk
+            for v in json.loads(f.read_text()).values():
+                if re.fullmatch(r"[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}", str(v)):
+                    terms[str(v)] = f"Railway-ID ({f.stem})"
     except LookupError:
         pass
     return terms, secrets
