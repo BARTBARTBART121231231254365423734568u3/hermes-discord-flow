@@ -192,7 +192,7 @@ tijden:
   staging: "*/2 * * * *"
   opruimcontrole: "*/10 * * * *"
   bordbewaking: "*/15 * * * *"   # ook de meldingen van vastgelopen en mislukte kaarten
-  werkmappen_opruimen: "15 */4 * * *"
+  werkmappen_opruimen: "15 * * * *"
   schijfruimte: every 30m
   samenvatting: "0 8 * * *"
   # systemd-timers (in de tijdzone hierboven); install.sh schrijft ze in de units.
@@ -214,7 +214,7 @@ drempels:
   swap_max_gb: 2.5
   geheugen_min_mb: 400
   checkin_max_uur: 2                # alleen als gezondheid.ops_checkin aan staat
-  werkmappen_resten_max: 10         # meer werkmappen van afgeronde kaarten = melding
+  werkmap_te_laat_marge_uur: 2      # melding als een werkmap langer dan gesloten_na_uur + marge dicht is en er nog staat
   werkmappen_totaal_max_gb: 12      # werkmappen samen groter = melding
   werkmap_gesloten_na_uur: 6        # zo lang na done/archived mag een werkmap weg
   review_prioriteit: 10             # review- en eindcontrolekaarten krijgen deze prioriteit (voor nieuwe bouwkaarten)

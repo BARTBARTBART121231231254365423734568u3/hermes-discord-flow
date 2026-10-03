@@ -122,7 +122,7 @@ DEFAULTS = {
         "staging": "*/2 * * * *",
         "opruimcontrole": "*/10 * * * *",
         "bordbewaking": "*/15 * * * *",
-        "werkmappen_opruimen": "15 */4 * * *",
+        "werkmappen_opruimen": "15 * * * *",  # elk uur (besluit eigenaar 03-10: piek 15 gesloten kaarten per uur)
         "schijfruimte": "every 30m",
         "samenvatting": "0 8 * * *",
         "ochtendrapport": "07:30",
@@ -140,7 +140,7 @@ DEFAULTS = {
         "swap_max_gb": 2.5,
         "geheugen_min_mb": 400,
         "checkin_max_uur": 2,
-        "werkmappen_resten_max": 10,
+        "werkmap_te_laat_marge_uur": 2,  # melding als een werkmap > gesloten_na_uur + marge dicht is en er nog staat
         "werkmappen_totaal_max_gb": 12,
         "werkmap_gesloten_na_uur": 6,
         "review_prioriteit": 10,

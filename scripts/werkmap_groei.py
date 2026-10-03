@@ -68,7 +68,8 @@ DRAIN = HOME / "state" / "drain.json"
 DAY = 86400
 CLOSED_GRACE = int(fc.get("drempels.werkmap_gesloten_na_uur") * 3600)  # done/archived for longer → may go
 LEFTOVER_MISSING_AGE = DAY    # growth check: counts a card-less folder as leftover after 24 h
-LEFTOVER_MAX = int(fc.get("drempels.werkmappen_resten_max"))
+# Te laat (besluit eigenaar 03-10): langer dan bewaartermijn + marge dicht en nog niet opgeruimd; geen grens op aantal.
+OVERDUE = CLOSED_GRACE + int(fc.get("drempels.werkmap_te_laat_marge_uur") * 3600)
 TOTAL_MAX = int(fc.get("drempels.werkmappen_totaal_max_gb") * 1024 ** 3)
 ARCHIVE_RESERVE = 5 * 1024 ** 3  # keep this much free on the archive disk after tarring
 BACKUP_PREFIX = "hermes-backup/"  # fork patch 3b: uncommitted work secured as hermes-backup/<card>/<utc-ts>
@@ -285,6 +286,7 @@ def inventory(kinds=("werkmap", "worktree"), now=None, info=None) -> list:
             item["decision"], item["reason"] = "blijft", "map in gebruik door een proces"
         else:
             item["decision"], item["reason"] = decide(ids, info, newest, now)
+            item["closed_at"] = max((info["cards"][i]["closed_at"] for i in ids if i in info["cards"]), default=0)
         items.append(item)
         return item
 
@@ -329,7 +331,8 @@ def gb(n) -> str:
 
 def growth_report(now=None, items=None) -> dict:
     """Totals for the health check: size of card workspaces + worktrees (live: real disk use, hardlinks
-    once), the leftovers (folders of done/archived cards > CLOSED_GRACE, or card-less > 24 h) and the 5 largest."""
+    once), the leftovers (folders of done/archived cards > CLOSED_GRACE, or card-less > 24 h), the overdue ones (closed
+    longer than CLOSED_GRACE + margin and still there: the cleanup is not working) and the 5 largest."""
     live = items is None
     items = items if items is not None else inventory(now=now)
     per_kind = {}
@@ -338,6 +341,7 @@ def growth_report(now=None, items=None) -> dict:
     now = now or time.time()
     left = [i for i in items if i["decision"] == "weg" or (
         i.get("reason", "").startswith("geen bekende kaart") and i.get("newest") and now - i["newest"] > LEFTOVER_MISSING_AGE)]
+    late = [i for i in items if i["decision"] == "weg" and i.get("closed_at") and now - i["closed_at"] > OVERDUE]
     largest = sorted(items, key=lambda i: -i["size"])[:5]
     total = sum(per_kind.values())
     if live and items:  # one du over all folders: pnpm hardlinks count once (per folder: 15.4 vs real 9.1 GB, 01-10)
@@ -355,7 +359,8 @@ def growth_report(now=None, items=None) -> dict:
         "onbekend": sum(1 for i in items if i["decision"] == "onbekend"),
         "grootste": [{"pad": str(i["path"]), "naam": i["name"], "soort": i["kind"], "bytes": i["size"],
                       "besluit": i["decision"]} for i in largest],
-        "ok": len(left) <= LEFTOVER_MAX and total <= TOTAL_MAX,
+        "te_laat": len(late),
+        "ok": not late and total <= TOTAL_MAX,
     }
 
 

@@ -30,7 +30,7 @@ Checks (key in health.json → what fails it):
   ops-checkin            (only when gezondheid.ops_checkin) ~/.hermes/state/ops-checkin.json {"at": epoch} older
                          than drempels.checkin_max_uur or missing (the ops session writes it hourly).
   werkmappen             (only when WERKMAPPEN_AAN = gezondheid.werkmappen) card work folders (scratch workspaces + git
-                         worktrees, see werkmap_groei.py): more leftovers than drempels.werkmappen_resten_max or more
+                         worktrees, see werkmap_groei.py): a folder closed > grace + margin and still there, or more
                          than drempels.werkmappen_totaal_max_gb in total; the detail names the counts, sizes and the
                          largest folders.
 
@@ -638,7 +638,8 @@ def probe_werkmappen(now=None):
     kinds = {"werkmap": "werkmappen", "worktree": "worktrees", "wees": "wezen"}
     split = ", ".join(f"{kinds.get(k, k)} {gb(v)}" for k, v in sorted(r["per_soort"].items(), key=lambda kv: -kv[1]))
     big = ", ".join(f"{g['naam']} {gb(g['bytes'])}" for g in r["grootste"][:3])
-    detail = (f"{r['resten']} resten ({gb(r['resten_bytes'])}; grens {werkmap_groei.LEFTOVER_MAX}), "
+    detail = (f"{r['te_laat']} te laat (> {werkmap_groei.OVERDUE // 3600} u dicht, niet opgeruimd); "
+              f"{r['resten']} resten ({gb(r['resten_bytes'])}), "
               f"totaal {gb(r['totaal'])} op schijf (grens {gb(werkmap_groei.TOTAL_MAX)}; los per soort: {split or '-'}); "
               f"grootste: {big or '-'}")
     return [result("werkmappen", r["ok"], detail, label="Werkmappen")]
