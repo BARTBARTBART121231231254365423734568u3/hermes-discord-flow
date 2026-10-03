@@ -42,7 +42,8 @@ def test_texts_format():
                   label="L", detail="d", sinds="09:00", status="failed/dead", host="h", vrij=1.0, totaal=2.0,
                   procent=50.0, drempel=10.0, nr="2026-01-01.1", notitie="n", score="1/1", datum="01-01",
                   modus="opstart", tot="2026-01-31", reden="r", prefix="Vraag voor de eigenaar:", branch="staging", commit="abc",
-                  wie="manager", wanneer="01-01 10:00", oplossing="o", oudste="01-01 09:00")
+                  wie="manager", wanneer="01-01 10:00", oplossing="o", oudste="01-01 09:00", weg=1, bewaard=2,
+                  naam="Claude", reset="ma 10:00", stop=90)
     for path in walk(fc.get("teksten"), ""):
         fc.text(path, **values)  # raises on an unknown placeholder
 

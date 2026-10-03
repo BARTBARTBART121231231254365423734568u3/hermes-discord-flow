@@ -28,7 +28,6 @@ Options:
 import fnmatch
 import getpass
 import json
-import os
 import re
 import socket
 import subprocess

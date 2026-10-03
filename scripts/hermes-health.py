@@ -47,6 +47,7 @@ Log: ~/.hermes/logs/hermes-health.log.
 """
 import json
 import os
+import pwd
 import re
 import shlex
 import shutil
@@ -63,7 +64,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import discord_post as dp  # noqa: E402
 import flow_config as fc  # noqa: E402
 import werkmap_groei  # noqa: E402
-from team_projects import HOME, active_projects, boards, kanban  # noqa: E402
+from flow_config import HOME, active_projects, boards, kanban  # noqa: E402
 
 # Projects to check (slug = file name in ~/.hermes/team/projects/), from the flow config "projecten":
 # "db": where the default DATABASE_URL lives (None = no DB check); "health": health path on the staging URL;
@@ -203,6 +204,15 @@ def probe_model_login(now=None):
         if not _executable(os.path.expanduser(cmd)):
             broken += 1
             problems.append(f"{env.relative_to(HOME)} wijst naar een ontbrekend bestand")
+    if fc.agent_gebruiker() and not fc.ben_agent():  # de agent heeft een eigen Claude-login
+        try:
+            st = run(fc.als_agent(["claude", "auth", "status"]), 30)
+            logged_in = bool(json.loads(st.stdout or "{}").get("loggedIn"))
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            logged_in = False
+        if not logged_in:
+            problems.append(f"Claude-login van {fc.agent_gebruiker()} werkt niet (claude auth status)")
+            wrapper_ok = False
     hits = lines_since(AGENT_LOG, now - WINDOW, AUTH_FAIL)
     if hits:
         problems.append(f"{len(hits)}× 'Primary auth failed' in agent.log (laatste {hhmm(hits[-1][0])})")
@@ -278,7 +288,9 @@ def probe_git():
     for slug, p in project_list().items():
         env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "/bin/false"}
         try:
-            r = run(["git", "-C", str(p["repo"]), "ls-remote", "--heads", "origin"], 20, env)
+            # als de agent (vlag aan): test het token van de agent; de ops-gebruiker draait nooit git in een agentrepo
+            r = run(fc.als_agent(["env", "GIT_TERMINAL_PROMPT=0", "GIT_ASKPASS=/bin/false", "git", "-C",
+                                  str(p["repo"]), "ls-remote", "--heads", "origin"]), 20, env)
             ok = r.returncode == 0 and bool(r.stdout.strip())
             why = (r.stderr.strip().splitlines() or ["geen heads"])[-1]
         except (OSError, subprocess.TimeoutExpired) as exc:
@@ -323,7 +335,7 @@ def probe_staging():
 
 def probe_gateway():
     try:
-        state = run(["systemctl", "--user", "is-active", UNIT], 15).stdout.strip() or "?"
+        state = run(fc.systemctl_gateway("is-active", UNIT), 15).stdout.strip() or "?"
     except (OSError, subprocess.TimeoutExpired) as exc:
         state = type(exc).__name__
     return [result("gateway", state == "active", f"{UNIT}: {state}", blocking=True, label="Gateway")]
@@ -388,7 +400,7 @@ def probe_dispatcher(now=None):
 
 def probe_workers(now=None):
     now = now or time.time()
-    listing = run(["systemctl", "--user", "list-units", "--type=scope", "--plain", "--no-legend"], 15).stdout
+    listing = run(fc.systemctl_gateway("list-units", "--type=scope", "--plain", "--no-legend"), 15).stdout
     runs = {}
     for _board, db in boards():
         conn = kanban(db)
@@ -418,21 +430,161 @@ def probe_workers(now=None):
 def probe_herstartlus(now=None):
     """User services stuck restarting (incident 01-10: a retry unit restarted 3x after a finished run because its
     ExecStopPost hook ran past TimeoutStopSec). Two or more restarts while in auto-restart = a loop."""
-    listing = run(["systemctl", "--user", "list-units", "--type=service", "--all", "--plain", "--no-legend",
-                   "--state=auto-restart"], 15).stdout
     loops = []
-    for line in listing.splitlines():
-        unit = line.split()[0] if line.split() else ""
-        if not unit.endswith(".service"):
-            continue
-        show = run(["systemctl", "--user", "show", unit, "-p", "NRestarts", "-p", "Result", "-p", "ExecMainStatus"],
-                   15).stdout
-        props = dict(l.split("=", 1) for l in show.splitlines() if "=" in l)
-        if int(props.get("NRestarts") or 0) >= 2:
-            loops.append(f"{unit} ({props.get('NRestarts')}x herstart, laatste: {props.get('Result')}, "
-                         f"exit {props.get('ExecMainStatus')})")
+    for sysctl in fc.systemctl_managers():  # eigen user-manager en (vlag aan) die van de agent
+        listing = run([*sysctl, "list-units", "--type=service", "--all", "--plain", "--no-legend",
+                       "--state=auto-restart"], 15).stdout
+        for line in listing.splitlines():
+            unit = line.split()[0] if line.split() else ""
+            if not unit.endswith(".service"):
+                continue
+            show = run([*sysctl, "show", unit, "-p", "NRestarts", "-p", "Result", "-p", "ExecMainStatus"],
+                       15).stdout
+            props = dict(l.split("=", 1) for l in show.splitlines() if "=" in l)
+            if int(props.get("NRestarts") or 0) >= 2:
+                loops.append(f"{unit} ({props.get('NRestarts')}x herstart, laatste: {props.get('Result')}, "
+                             f"exit {props.get('ExecMainStatus')})")
     return [result("herstartlus", not loops, "; ".join(loops) if loops else "geen diensten in een herstartlus",
                    label="Herstartlus")]
+
+
+# Bewust van de ops-gebruiker (rechten-agent.sh, Z3) en ops-bestanden die zijn scripts schrijven (geen Hermes-code).
+# Was eigenaar-gate.sh --alleen-bestanden (blok A1 samengevoegd; de volledige overstap-gate staat in het archief).
+_EIGENAAR_PRUNE = ("scripts", "bin", "plugins", "hooks", "secrets", "workflow-inbox", "profiles/*/plugins",
+                   "profiles/*/hooks", "profiles/*/bin")
+_EIGENAAR_PADEN = ("", ".env", "config.yaml", "SOUL.md", "hermes-agent", "team", "team/TEAM.md", "team/flow.yaml",
+                   "team/discord.json", "team/workflow-modus.json", "team/kleurplaat-template.md",
+                   "team/task-template.md", "profiles")
+
+
+OPS_USER = pwd.getpwuid(os.getuid()).pw_name  # de ops-gebruiker: wie de gezondheidscheck draait (nooit de agent)
+
+
+def _find_ops(h):
+    """(sqlite_van_ops, buiten_de_lijst): paden van de ops-gebruiker in ~/.hermes (find, regels van de oude gate)."""
+    h = str(h).rstrip("/")
+    sq = run(["find", h, "-xdev", "-user", OPS_USER, "(", "-name", "*.db", "-o", "-name", "*.db-wal", "-o", "-name",
+              "*.db-shm", "-o", "-name", "*.db-journal", "-o", "-name", "*.sqlite*", ")", "-printf", "%p\n"], 120)
+    prune = [x for d in _EIGENAAR_PRUNE for x in ("-o", "-path", f"{h}/{d}")][1:]
+    keep = [x for d in _EIGENAAR_PADEN for x in ("!", "-path", f"{h}/{d}".rstrip("/"))]
+    buiten = run(["find", h, "-xdev", "(", *prune, ")", "-prune", "-o", "-user", OPS_USER, *keep,
+                  "!", "-regex", f"{h}/profiles/[^/]*", "!", "-regex", f"{h}/profiles/[^/]*/\\(\\.env\\|config\\.yaml\\|SOUL\\.md\\)",
+                  "!", "(", "-regex", f"{h}/state/[^/]*\\.\\(json\\|jsonl\\|txt\\)", "-a", "!", "-name", "*.db*", ")",
+                  "!", "-regex", f"{h}/logs/[^/]*\\.log", "!", "-regex", f"{h}/state/config\\.yaml\\.voor-drain-[0-9]*",
+                  "-printf", "%p\n"], 120)
+    return ([l for l in sq.stdout.splitlines() if l.strip()], [l for l in buiten.stdout.splitlines() if l.strip()])
+
+
+def probe_eigenaar(now=None):
+    """Eén Hermes-eigenaar (besluit eigenaar 03-10, incident poging 6): na de overstap geen SQLite-bestand van de
+    ops-gebruiker in ~/.hermes en geen bestanden van hem buiten de bewuste lijst. Een -wal/-shm van de ops-gebruiker
+    laat de agent niet meer schrijven (blokkerend). Alleen als de vlag agent.gebruiker aan staat."""
+    if not fc.agent_gebruiker():
+        return []
+    sq, buiten = _find_ops(HOME)
+    fout = ([f"SQLite-bestanden van {OPS_USER}: {' '.join(sq[:5])}"] if sq else []) + \
+           ([f"{len(buiten)} bestand(en) van {OPS_USER} buiten de lijst, bijv.: {' '.join(buiten[:5])}"] if buiten else [])
+    return [result("eigenaar", not fout, "; ".join(fout) or f"geen bestanden of SQLite van {OPS_USER} in ~/.hermes (buiten de lijst)",
+                   blocking=bool(sq), label="Eén Hermes-eigenaar")]
+
+
+def probe_proc(now=None):
+    """/proc is gemount met hidepid (besluit eigenaar 03-10, review punt 1): de agent ziet alleen zijn eigen
+    processen, dus geen opdrachtregels (met mogelijke geheimen) van de ops-gebruiker of root. Alleen met de vlag
+    agent.gebruiker."""
+    if not fc.agent_gebruiker():
+        return []
+    opts = next((l.split()[3] for l in Path("/proc/self/mounts").read_text().splitlines()
+                 if l.split()[1:2] == ["/proc"]), "")
+    ok = "hidepid=invisible" in opts or "hidepid=2" in opts
+    open_ = open_private_dirs()
+    detail = ("agent ziet alleen eigen processen (hidepid)" if ok else
+              f"/proc zonder hidepid ({opts}): de agent kan opdrachtregels van andere gebruikers lezen")
+    if open_:
+        detail += "; voor de agent leesbaar (moet 700): " + ", ".join(open_)
+    return [result("proc-afscherming", ok and not open_, detail, label="Afscherming agent")]
+
+
+def ops_map_naam():
+    """Naam van de ops-map onder de home: de map van het incidentenlogboek (paden.incidentenlog), of None."""
+    log = fc.optional_path("incidentenlog")
+    return os.path.relpath(log.parent, Path.home()) if log else None
+
+
+def open_private_dirs(home=None, ops=None):
+    """Mappen van de ops-gebruiker die de agent nooit mag lezen (gate rechten-agent.sh; incident 03-10: chmod 755
+    op de ops-map): ops-map (``ops``, standaard ops_map_naam()), back-ups, archieven, ssh, ops-config.
+    Fout = 'other' heeft r of x."""
+    home = Path(home or Path.home())
+    ops = ops or ops_map_naam()
+    paden = [*([home / ops] if ops else []), home / ".ssh", *([home / ".config" / Path(ops).name] if ops else []),
+             *home.glob("hermes-backup-*"), *home.glob("hermes-archief-*")]
+    return [str(q.relative_to(home)) for q in paden if q.exists() and q.stat().st_mode & 0o007]
+
+
+def _schrijfbaar_voor_anderen(pad, gebruiker):
+    """True als groep, anderen of een andere ACL-gebruiker effectief mag schrijven (StrictModes weigert dan)."""
+    st = run(["sudo", "-n", "stat", "-c", "%a", pad], 10).stdout.strip()
+    if not st or not int(st, 8) & 0o022:
+        return False
+    for line in run(["sudo", "-n", "getfacl", "-p", pad], 10).stdout.splitlines():
+        m = re.match(r"^(user:[^:]*|group:[^:]*|other):[^:]*?:?([rwx-]{3})(?:\s+#effective:([rwx-]{3}))?", line)
+        if not m or line.startswith("user::") or line.startswith(f"user:{gebruiker}:"):
+            continue
+        if "w" in (m.group(3) or m.group(2)):
+            return True
+    return False
+
+
+def ssh_problemen(sinds="-2h"):
+    """SSH-login met een sleutel kan werken (zoals sshd met StrictModes eist), zonder in te loggen. Was
+    ssh-login-check.sh (blok A1 samengevoegd). Leest alleen; sudo -n alleen voor stat/getfacl/grep/journal."""
+    fout = []
+    for s in ("ssh", "tailscaled"):
+        if run(["systemctl", "is-active", s], 10).stdout.strip() != "active":
+            fout.append(f"{s} niet actief")
+    if "pubkeyauthentication yes" not in run(["sudo", "-n", "sshd", "-T"], 20).stdout.splitlines():
+        fout.append("sshd: PubkeyAuthentication niet aan (of sshd -T niet leesbaar)")
+    agent = fc.agent_gebruiker()
+    gebruikers = [OPS_USER] + ([agent] if agent else [])
+    for u in gebruikers:
+        home = os.path.expanduser(f"~{u}")
+        for p in (home, f"{home}/.ssh", f"{home}/.ssh/authorized_keys"):
+            st = run(["sudo", "-n", "stat", "-c", "%U %a", p], 10)
+            if st.returncode != 0 or not st.stdout.strip():
+                fout.append(f"{u}: {p} ontbreekt")
+                continue
+            eigenaar, mode = st.stdout.split()
+            if eigenaar != u:
+                fout.append(f"{u}: {p} is van {eigenaar} (StrictModes weigert)")
+            if _schrijfbaar_voor_anderen(p, u):
+                fout.append(f"{u}: {p} schrijfbaar voor groep/anderen (StrictModes weigert)")
+            if p.endswith("/.ssh") and int(mode, 8) & 0o777 != 0o700:
+                fout.append(f"{u}: ~/.ssh niet 700")
+            if p.endswith("authorized_keys") and int(mode, 8) & 0o777 != 0o600:
+                fout.append(f"{u}: authorized_keys niet 600")
+        if run(["sudo", "-n", "test", "-s", f"{home}/.ssh/authorized_keys"], 10).returncode != 0:
+            fout.append(f"{u}: authorized_keys leeg")
+    if agent:
+        n = run(["sudo", "-n", "grep", "-cE", " (windows-pc|macbook)$",
+                 os.path.expanduser(f"~{agent}/.ssh/authorized_keys")], 10)
+        if not n.stdout.strip().isdigit() or int(n.stdout.strip()) < 1:
+            fout.append(f"{agent}: geen desktop-sleutel")
+    j = run(["sudo", "-n", "journalctl", "-u", "ssh", "--since", sinds, "--no-pager"], 30).stdout
+    n = sum(1 for line in j.splitlines()
+            if re.search(r"(?i)bad ownership or modes|Authentication refused|bad permissions", line))  # regels, als grep -c
+    if n:
+        fout.append(f"sshd-journal: {n} keer geweigerd door rechten (sinds {sinds})")
+    return fout
+
+
+def probe_ssh(now=None):
+    """SSH-login met een sleutel kan werken voor de ops-gebruiker en (na de overstap) de agent: sshd/tailscaled actief,
+    rechten zoals StrictModes eist, desktop-sleutel bij de agent, geen weigeringen in de sshd-journal (incident
+    03-10: de desktop-app kon na de overstap niet meer verbinden)."""
+    fout = ssh_problemen("-2h")
+    return [result("ssh-login", not fout, "; ".join(fout) or f"SSH-login met sleutel kan werken ({OPS_USER} en agent)",
+                   label="SSH-login")]
 
 
 def _meminfo() -> dict:
@@ -445,7 +597,9 @@ def _meminfo() -> dict:
 
 def probe_resources():
     free = shutil.disk_usage("/").free
-    out = [result("schijf", free >= DISK_MIN, f"{free / 1024 ** 3:.1f} GB vrij op /", label="Schijfruimte")]
+    # Blokkerend (→ #meldingen met ping): een volle schijf legt het projectwerk stil. Vervangt disk_space_watch.py (blok A1).
+    out = [result("schijf", free >= DISK_MIN, f"{free / 1024 ** 3:.1f} GB vrij op /", blocking=free < DISK_MIN,
+                  label="Schijfruimte")]
     try:
         m = re.search(r"^some .*?avg300=([\d.]+)", Path("/proc/pressure/cpu").read_text(), re.M)
         cpu = float(m.group(1))
@@ -481,7 +635,7 @@ def probe_ops_checkin(now=None):
 def probe_werkmappen(now=None):
     r = werkmap_groei.growth_report(now=now)
     gb = werkmap_groei.gb
-    kinds = {"werkmap": "werkmappen", "worktree": "worktrees", "wees": "wezen", "preview": "previews"}
+    kinds = {"werkmap": "werkmappen", "worktree": "worktrees", "wees": "wezen"}
     split = ", ".join(f"{kinds.get(k, k)} {gb(v)}" for k, v in sorted(r["per_soort"].items(), key=lambda kv: -kv[1]))
     big = ", ".join(f"{g['naam']} {gb(g['bytes'])}" for g in r["grootste"][:3])
     detail = (f"{r['resten']} resten ({gb(r['resten_bytes'])}; grens {werkmap_groei.LEFTOVER_MAX}), "
@@ -497,7 +651,7 @@ def probes():
     extra = [probe_werkmappen] if WERKMAPPEN_AAN else []
     checkin = [probe_ops_checkin] if OPS_CHECKIN_AAN else []
     return [probe_model_login, probe_db, probe_pg_log, probe_git, probe_staging, probe_gateway,
-            probe_dispatcher, probe_workers, probe_herstartlus, probe_resources] + checkin + extra
+            probe_dispatcher, probe_workers, probe_herstartlus, probe_eigenaar, probe_ssh, probe_proc, probe_resources] + checkin + extra
 
 
 def collect() -> list:
@@ -517,9 +671,7 @@ def collect() -> list:
 
 # ------------------------------------------------------------------ routing
 def log(line):
-    LOG.parent.mkdir(parents=True, exist_ok=True)
-    with LOG.open("a") as fh:
-        fh.write(f"{datetime.now(NL).isoformat(timespec='seconds')} {line}\n")
+    fc.log(LOG, line)
 
 
 def _open_events(check):

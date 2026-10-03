@@ -40,13 +40,7 @@ MAX_TOTAL = 12000
 
 
 def log(line):
-    if "--dry-run" in sys.argv:  # a dry run writes nothing, also no log line
-        print(line)
-        return
-    LOG.parent.mkdir(parents=True, exist_ok=True)
-    with LOG.open("a") as fh:
-        fh.write(f"{datetime.now(NL).isoformat(timespec='seconds')} {line}\n")
-    print(line)
+    fc.log(LOG, line, echo=True, schrijf="--dry-run" not in sys.argv)  # a dry run writes nothing, also no log line
 
 
 def fmt(ts):
@@ -61,7 +55,7 @@ def set_title(dry):
     except (OSError, ValueError, KeyError):
         return 0  # no rotation yet: leave the old session's title alone
     chatlog = fc.channel_ids()["chatlog"]
-    conn = sqlite3.connect(f"file:{H / 'state.db'}?mode=ro", uri=True, timeout=10)
+    conn = fc.connect_ro(H / 'state.db')
     conn.row_factory = sqlite3.Row
     s = conn.execute("SELECT id, started_at, title FROM sessions WHERE ended_at IS NULL AND session_key LIKE ? "
                      "AND started_at > ? ORDER BY started_at DESC LIMIT 1",
@@ -86,7 +80,7 @@ def main():
         return set_title(dry)
     now = time.time()
     chatlog = fc.channel_ids()["chatlog"]
-    conn = sqlite3.connect(f"file:{H / 'state.db'}?mode=ro", uri=True, timeout=10)
+    conn = fc.connect_ro(H / 'state.db')
     conn.row_factory = sqlite3.Row
     s = conn.execute("SELECT id, started_at, last_activity_at FROM sessions WHERE ended_at IS NULL "
                      "AND session_key LIKE ? ORDER BY started_at DESC LIMIT 1",
@@ -134,7 +128,7 @@ def main():
         HANDOFF.replace(HANDOFF.with_suffix(".md.vorige"))
     HANDOFF.write_text(body)
     sys.path.insert(0, str(H / "hermes-agent"))
-    from hermes_state import SessionDB
+    from hermes_state import SessionDB  # eigenaar-ok: draait als de agent (unit van de agent)
     SessionDB(db_path=H / "state.db").end_session(s["id"], "nightly_rotate")
     ROTATED.write_text(json.dumps({"at": now, "ended": s["id"]}))
     log(f"{s['id']} afgesloten ({age / 3600:.0f} uur oud); overdracht {len(body)} tekens")

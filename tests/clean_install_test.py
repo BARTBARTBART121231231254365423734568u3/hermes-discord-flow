@@ -15,14 +15,15 @@ README test list and checks every Discord call in the fake's log:
   vraag          a valid question → forum post with tags, ⭐ button first, "Anders…"; an incomplete one goes back
   knop           simulated click (what the patched gateway does) → beantwoord; manager unblocks; card done → verwerkt
   anders         simulated "Anders…" answer + "Wacht op …" wait state → beantwoord, no new post; team-status
-  melding        discord_post.py meldingen + kanban-stuck-check ("beslissing manager") with ping; resolved later
+  melding        discord_post.py meldingen with ping; board-guard.py: a block wakes the manager (no message), a
+                 failed card → one "kaart mislukt" with ping, never twice, resolved later
   staging        first run summary, then one silent line per card; phase complete → #meldingen + production question
   samenvatting   daily-summary-data.py output + the cron job's delivery target and prompt
   ochtendrapport the morning report in #ochtendrapport (one ping)
   gezondheid     hermes-health.py: blocking failure → #meldingen, resolved → "✅ opgelost", no duplicates
   release        hermes-release.py → flow-controle --quick green → one silent line in #releases
   bordbewaking   board-guard.py on an empty scratch board: 0 anomalies, nothing posted
-  opruiming      clean_kanban_workspaces.py --dry-run and the growth report
+  opruiming      werkmap_groei.py --dry-run and the growth report (--groei)
   gateway        gateway-watch.py: baseline, then an unexpected restart → #meldingen
   privacy        the scanner finds nothing in the repo copy nor in what was posted; no real home path anywhere
   patches        (with --hermes) the button/modal tests of the patches in the given Hermes checkout
@@ -231,8 +232,8 @@ class Run:
         self.sh("bash", self.repo / "install.sh")
         jobs = json.loads((self.tmp / "fake-hermes" / "fake-cron.json").read_text())
         names = {j["name"]: j for j in jobs}
-        for n in ("Vraag van het team", "Staging klaar", "Vastgelopen-check", "Discord-opruimcontrole",
-                  "Dagelijkse samenvatting", "Bordbewaking", "Kanban workspace cleanup", "Schijfruimte"):
+        for n in ("Vraag van het team", "Staging klaar", "Discord-opruimcontrole",
+                  "Dagelijkse samenvatting", "Bordbewaking", "Kanban workspace cleanup"):
             assert n in names, f"cronjob {n} ontbreekt"
         assert names["Vraag van het team"]["no_agent"] and names["Vraag van het team"]["schedule"] == "*/2 * * * *"
         assert names["Dagelijkse samenvatting"]["deliver"] == f"discord:{self.ids()['samenvatting']}"
@@ -360,23 +361,26 @@ class Run:
         m = self.messages("meldingen")[-1]
         assert m["content"] == f"<@{OWNER}> Testmelding" and m["allowed_mentions"]["users"] == [OWNER]
         kf.add_card(self.db, "t_aaaa0005", "Bouwkaart met keuze", status="todo", assignee="coder", project_id=self.pid)
-        kf.block(self.db, "t_aaaa0005", "beslissing manager: welke tabel?", ago=60)
-        self.py("kanban-stuck-check.py")
-        m = self.messages("meldingen")[-1]
-        assert "Beslissing manager nodig: t_aaaa0005" in m["content"] and m["content"].startswith(f"<@{OWNER}>")
-        for _ in range(50):  # the wake-up runs detached
-            if any(c[:1] == ["chat"] for c in self.hermes_calls()):
-                break
-            time.sleep(0.1)
-        assert any(c[:1] == ["chat"] for c in self.hermes_calls()), "manager niet gewekt"
+        kf.block(self.db, "t_aaaa0005", "beslissing manager: welke tabel?", ago=45 * 60)
         n = len(self.messages("meldingen"))
-        self.py("kanban-stuck-check.py")
+        self.py("board-guard.py")
+        assert len(self.messages("meldingen")) == n, "een blokkade hoort niet in #meldingen"
+        assert any(c[:1] == ["chat"] and "t_aaaa0005" in " ".join(c) for c in self.hermes_calls()), "manager niet gewekt"
+        kf.add_card(self.db, "t_aaaa0006", "Bouwkaart mislukt", status="blocked", assignee="coder", project_id=self.pid)
+        with kf.conn(self.db) as c:
+            c.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES ('t_aaaa0006', 'crashed', "
+                      "NULL, ?)", (int(time.time()) - 60,))
+        self.py("board-guard.py")
+        m = self.messages("meldingen")[-1]
+        assert "Kaart mislukt: t_aaaa0006" in m["content"] and m["content"].startswith(f"<@{OWNER}>"), m["content"]
+        n = len(self.messages("meldingen"))
+        self.py("board-guard.py")
         assert len(self.messages("meldingen")) == n, "dubbele melding"
-        kf.set_status(self.db, "t_aaaa0005", "ready")
+        kf.set_status(self.db, "t_aaaa0006", "done", completed=True)
         self.py("discord-cleanup.py")
-        edited = [x for x in self.messages("meldingen") if "t_aaaa0005" in x["content"]][0]
+        edited = [x for x in self.messages("meldingen") if "t_aaaa0006" in x["content"]][0]
         assert edited["content"].startswith("✅ opgelost (") and "~~" in edited["content"], edited["content"]
-        return "ping-melding, beslissing manager + manager gewekt, geen dubbele, daarna ✅ opgelost"
+        return "ping-melding; blokkade → manager gewekt, geen melding; kaart mislukt één keer, daarna ✅ opgelost"
 
     def s_staging(self):
         c1 = self.commit("f1-01")
@@ -415,11 +419,13 @@ class Run:
         assert dry.startswith("**Ochtendrapport workflow") and "(modus: opstart)" in dry
         n = len(self.messages("ochtendrapport"))
         self.py("hermes-ochtendrapport.py")
-        m = self.messages("ochtendrapport")
-        assert len(m) == n + 1 and m[-1]["content"].startswith(f"<@{OWNER}> **Ochtendrapport workflow")
+        m = self.messages("ochtendrapport")[n:]  # het rapport wordt op secties gesplitst; alleen het eerste pingt
+        assert m and m[0]["content"].startswith(f"<@{OWNER}> **Ochtendrapport workflow")
+        assert all(f"<@{OWNER}>" not in x["content"] for x in m[1:]), "meer dan één ping"
+        alles = "\n".join(x["content"] for x in m)
         for kop in ("**Gezondheid**", "**Nacht**", "**Uitgevoerd / zelf opgelost**", "**Open workflowpunten**"):
-            assert kop in m[-1]["content"], kop
-        return "rapport met één ping in #ochtendrapport"
+            assert kop in alles, kop
+        return f"rapport in {len(m)} bericht(en) met één ping in #ochtendrapport"
 
     def s_inbox(self):
         inbox = self.hh / "workflow-inbox"
@@ -517,9 +523,9 @@ class Run:
         return f"leeg bord: 0 afwijkingen, niets gepost; demo-bord: {found.strip().splitlines()[-1]}"
 
     def s_opruiming(self):
-        out = self.py("clean_kanban_workspaces.py", "--dry-run").stdout
+        out = self.py("werkmap_groei.py", "--dry-run").stdout
         assert out.startswith("== clean_kanban_workspaces --dry-run:"), out
-        rep = json.loads(self.py("werkmap_groei.py").stdout)
+        rep = json.loads(self.py("werkmap_groei.py", "--groei").stdout)
         assert rep["ok"] and "totaal" in rep
         return out.splitlines()[0]
 
@@ -533,11 +539,14 @@ class Run:
 
     def s_privacy(self):
         allow = self.tmp / "allowlist.txt"  # the test project of this run is local data, not personal
-        allow.write_text("*\t(?i)^demo$\t# testproject van deze test\n")
+        meegeleverd = self.repo / "scan-allowlist.txt"  # de beoordeelde uitzonderingen van het pakket gelden ook hier
+        allow.write_text("*\t(?i)^demo$\t# testproject van deze test\n"
+                         + (meegeleverd.read_text() if meegeleverd.exists() else ""))
         scan = self.repo / "scripts" / "scan_personal.py"
         r = self.sh(sys.executable, scan, "--allowlist", allow, self.repo, ok=False)
         assert r.returncode == 0, r.stdout[-800:]
-        posted = "\n".join(json.dumps(c, ensure_ascii=False) for c in self.log())
+        # Alleen wat er naar Discord geschreven wordt; GET-verzoeken bevatten berekende tijdgrenzen (before=<snowflake>).
+        posted = "\n".join(json.dumps(c, ensure_ascii=False) for c in self.log() if str(c[0] if isinstance(c, list) else c.get("method", "")).upper() != "GET")
         dump = self.tmp / "gepost.txt"
         dump.write_text(posted)
         r2 = self.sh(sys.executable, scan, "--allowlist", allow, dump, ok=False)

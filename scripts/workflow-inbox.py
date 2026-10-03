@@ -28,14 +28,13 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import discord_post as dp  # noqa: E402
 import flow_config as fc  # noqa: E402
-from team_projects import HOME  # noqa: E402  (.env files of this install)
+from flow_config import HOME  # noqa: E402  (.env files of this install)
 
-NL = ZoneInfo("Europe/Amsterdam")
+NL = fc.tz()
 INBOX = Path(os.environ.get("HERMES_WORKFLOW_INBOX") or fc.path("workflow_inbox"))
 DONE = INBOX / "afgehandeld"
 CHANNEL_KEY = "workflow-inbox"
@@ -258,8 +257,14 @@ def handle(name: str, solution: str):
     meta, body = split(path.read_text(encoding="utf-8", errors="replace"))
     meta.update(status="afgehandeld", afgehandeld_op=datetime.now(NL).isoformat(timespec="minutes"),
                 oplossing=" ".join(solution.split()))
-    path.write_text(join(meta, body), encoding="utf-8")
-    os.utime(path, (time.time() - SETTLE, time.time() - SETTLE))
+    tekst = join(meta, body)
+    # Altijd via een tijdelijk bestand + os.replace: een punt van de manager (de agent) mag de ops-gebruiker niet
+    # altijd beschrijven (bv. 644), en een eigen tijd zetten mag alleen de eigenaar. Daarna is het een ops-bestand
+    # (workflow-inbox staat op de lijst van probe_eigenaar in hermes-health.py).
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(tekst, encoding="utf-8")
+    os.utime(tmp, (time.time() - SETTLE, time.time() - SETTLE))
+    os.replace(tmp, path)
     _lock = dp.single_instance("workflow-inbox")  # noqa: F841
     return sync_file(path, secrets=env_values())
 

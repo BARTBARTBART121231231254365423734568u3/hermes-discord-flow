@@ -19,12 +19,15 @@ CLI (for install.sh and checks):
   flow_config.py get <a.b.c>         → one value (JSON for mappings/lists)
   flow_config.py check               → validates the config; exit 1 with what is wrong
   flow_config.py kanalen             → "<key> <id>" per known channel
+  flow_config.py als-agent-prefix    → "" (vlag agent.gebruiker leeg) of het pad van als-agent
 """
 import copy
 import json
 import os
 import re
 import sys
+import time
+from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -47,6 +50,7 @@ DEFAULTS = {
         "workflow_modus": "team/workflow-modus.json",
         "workflow_waits": "team/workflow-waits.json",
         "overdracht_chatlog": "team/overdracht-chatlog.md",
+        "discord_archief": "~/hermes-archief-discord",
     },
     "bord": {"naam": "team"},
     "rollen": {
@@ -57,6 +61,9 @@ DEFAULTS = {
         "max_totaal": 3,
     },
     "gateway": {"unit": "hermes-gateway.service"},
+    # Linux-gebruiker van de agents (gateway, workers, Hermes-cron). Leeg = alles draait als de huidige gebruiker
+    # (oude gedrag). Gezet: de ops-kant spreekt de gateway, Hermes, git in projectmappen en state.db aan via als-agent.
+    "agent": {"gebruiker": ""},
     "discord": {
         "guild_id": "<GUILD_ID>",
         "owner_id": "<OWNER_ID>",
@@ -113,9 +120,8 @@ DEFAULTS = {
     "tijden": {
         "vragen": "*/2 * * * *",
         "staging": "*/2 * * * *",
-        "vastgelopen": "*/5 * * * *",
         "opruimcontrole": "*/10 * * * *",
-        "bordbewaking": "*/30 * * * *",
+        "bordbewaking": "*/15 * * * *",
         "werkmappen_opruimen": "15 */4 * * *",
         "schijfruimte": "every 30m",
         "samenvatting": "0 8 * * *",
@@ -124,6 +130,10 @@ DEFAULTS = {
         "nachtcontrole": "02:30",
         "chatlog_rotatie": "04,05,06:00",
     },
+    # Abonnementen (besluit eigenaar 03-10): waarschuwen vanaf krap_procent, vanaf stop_procent (week, twee metingen)
+    # starten er geen nieuwe kaarten tot de reset of tot de eigenaar "doorgaan" zegt (limiet-poort.py).
+    "abonnement": {"providers": {"anthropic": "Claude", "openai-codex": "Codex"},
+                   "krap_procent": 70, "stop_procent": 90},
     "drempels": {
         "schijf_min_gb": 10,
         "cpu_max_procent": 60,
@@ -135,14 +145,14 @@ DEFAULTS = {
         "werkmap_gesloten_na_uur": 6,
         "review_prioriteit": 10,
         "review_wacht_min": 15,
-        "escalatie_uur": 6,
-        "manager_escalatie_uur": 2,
+        "opnieuw_wekken_uur": 6,
+        "blokkade_wek_min": 30,
+        "blokkade_vraag_uur": 2,
         "manager_opnieuw_wekken_min": 60,
-        "beslissing_manager_wacht_min": 30,
+        "coder_voorraad_min": 3,
         "vraag_zonder_post_min": 15,
         "ready_zonder_eigenaar_min": 30,
         "te_lang_running_uur": 3,
-        "vastgelopen_uur": 6,
         "triage_min": 60,
         "todo_min": 30,
         "ready_uur": 2,
@@ -160,7 +170,19 @@ DEFAULTS = {
         "ops_checkin": False,
         "werkmappen": True,
     },
-    "opruimen": {"overslaan_repos": [], "overslaan_namen": []},
+    "opruimen": {
+        "overslaan_repos": [], "overslaan_namen": [],
+        # Discord-berichten weg na deze termijnen (besluit eigenaar 03-10; discord-cleanup.py), altijd eerst naar
+        # paden.discord_archief. meldingen/gezondheid: alleen "✅ opgelost"; workflow-inbox: alleen doorgestreept;
+        # vragen: posts met de tag verwerkt, dagen sinds archivering. Vastgepinde berichten nooit.
+        "discord": {
+            "termijnen_dagen": {"chatlog": 7, "vragen": 14, "meldingen": 3, "staging": 14, "samenvatting": 14,
+                                "workflow-inbox": 7, "gezondheid": 3},
+            "melding_doorgeven_dagen": 14,
+            "max_per_ronde": 50,
+            "max_seconden": 60,
+        },
+    },
     "release": {
         "controle_commando": ["{python}", "{scripts}/flow-controle.py", "--quick"],
         "sync_commando": [],
@@ -187,19 +209,9 @@ DEFAULTS = {
         },
         "vastgelopen": {
             "vastgelopen": "Vastgelopen",
-            "beslissing_manager": "Beslissing manager nodig",
             "mislukt": "❌ Kaart mislukt: {id} {titel} ({project}) — {waarom}",
             "bouwer_onbeschikbaar": "⏸️ Bouwer niet beschikbaar: {aantal} kaart(en) wachten ({kaarten}). Er wordt "
                                     "geen ander model ingezet; ze gaan verder zodra de bouwer weer werkt.",
-        },
-        "bordbewaking": {
-            "escalatie": "🧭 Bordbewaking: {id} {titel} ({project}) — {waarom}. De manager kreeg dit {uren} uur "
-                         "geleden en het staat er nog.",
-            "escalatie_manager": "🧭 Kaart {id} {titel} ({project}) wacht al {uren} uur op een beslissing van de "
-                                 "manager en ligt stil.\n1. Open #chatlog: {link}\n2. Typ: `Pak eerst de blokkade van "
-                                 "{id} op, vóór je planwerk.`\n3. Daarna hoort de manager te antwoorden wat hij "
-                                 "besluit, en staat de kaart niet meer op geblokkeerd.\nAntwoord hier alleen met "
-                                 "\"gelukt\" of \"niet gelukt\".",
         },
         "gezondheid": {
             "blokkerend": "🔴 {label} faalt sinds {sinds}: {detail}. Projectwerk ligt stil.",
@@ -238,6 +250,11 @@ DEFAULTS = {
                        "inbox": "**Open workflowpunten**", "week": "**Week (incidentenlogboek)**"},
             "inbox_regel": "Workflow-inbox: {aantal} open (oudste: {oudste})",
             "inbox_leeg": "Workflow-inbox: niets open",
+            "backup_regel": "- 🗂️ Back-upbranches (niet-vastgelegd werk): {weg} opgeruimd sinds het vorige rapport, {bewaard} bewaard",
+            "abonnement_kop": "**Abonnement**",
+            "abonnement_regel": "- {naam} {label}: {procent}% gebruikt (reset {reset})",
+            "abonnement_krap": "- ⚠️ {naam}: week boven {drempel}%; bij {stop}% starten er geen nieuwe kaarten meer",
+            "abonnement_onbekend": "- verbruik niet op te vragen",
             "modusvraag": "❓ Beslissing in de ops-sessie: op {tot} overschakelen naar rapportmodus, of de "
                           "opstartmodus verlengen?",
             "voorstellen": {
@@ -382,12 +399,65 @@ def optional_path(key):
     return expand(value) if is_set(value) else None
 
 
+def discord_archief() -> Path:
+    """Archiefmap van verwijderde Discord-berichten. ``~`` is de thuismap van de agent-gebruiker als de vlag aan staat:
+    de opruiming (als de agent) en akkoord-check.py (als de ops-gebruiker, leest via de agent) zien zo dezelfde map."""
+    value = str(get("paden.discord_archief"))
+    if value.startswith("~") and agent_gebruiker() and not ben_agent():
+        import pwd
+        value = pwd.getpwnam(agent_gebruiker()).pw_dir + value[1:]
+    return expand(value, Path.home())
+
+
 def hermes_bin() -> str:
     return str(expand(get("paden.hermes_bin"), Path.home()))
 
 
 def tz() -> ZoneInfo:
     return ZoneInfo(get("tijdzone") or "UTC")
+
+
+def nu() -> datetime:
+    """Nu in de tijdzone van de flow (standaard Europe/Amsterdam; de server staat op UTC): voor weergave en
+    kalendervensters ("vandaag", "gisteren"). Rekenen met epoch-seconden blijft time.time()."""
+    return datetime.fromtimestamp(time.time(), tz())
+
+
+def tijd(ts=None, fmt="%d-%m %H:%M") -> str:
+    """Epoch-seconden (None = nu) als tekst in de tijdzone van de flow."""
+    return datetime.fromtimestamp(time.time() if ts is None else ts, tz()).strftime(fmt)
+
+
+def log(pad, line, echo=False, schrijf=True):
+    """Gedeelde logregel: ``<ISO-tijd in de flow-tijdzone> <line>`` achteraan ``pad`` (map wordt aangemaakt);
+    ``echo``: ook op stdout; ``schrijf=False`` (bijv. een droogloop): niets naar het bestand."""
+    if schrijf:
+        pad.parent.mkdir(parents=True, exist_ok=True)
+        with pad.open("a") as fh:
+            fh.write(f"{nu().isoformat(timespec='seconds')} {line}\n")
+    if echo:
+        print(line)
+
+
+def last_line(text, limit=None) -> str:
+    """De laatste niet-lege regel van ``text`` (gestript, hoogstens ``limit`` tekens), of "(geen uitvoer)"."""
+    lines = [l for l in (text or "").splitlines() if l.strip()]
+    return lines[-1].strip()[:limit] if lines else "(geen uitvoer)"
+
+
+def check_compile(files, limit=None, prefix=None):
+    """``(ok, detail)``: py_compile van ``files`` met de bytecode in een tijdelijke map (controle 1 van de
+    nachtelijke checks)."""
+    import py_compile
+    import tempfile
+    bad = []
+    with tempfile.TemporaryDirectory(prefix=prefix) as tmp:
+        for f in files:
+            try:
+                py_compile.compile(str(f), cfile=str(Path(tmp) / (f.stem + ".pyc")), doraise=True)
+            except py_compile.PyCompileError as e:
+                bad.append(f"{f.name}: {last_line(str(e), limit)}")
+    return not bad, f"{len(files) - len(bad)}/{len(files)} scripts compileren" + (f"; FOUT {'; '.join(bad)}" if bad else "")
 
 
 def owner_name() -> str:
@@ -404,10 +474,6 @@ def text(dotted, **values) -> str:
     if tpl is None:
         raise KeyError(f"tekst teksten.{dotted} ontbreekt in de config")
     return str(tpl).format(eigenaar=owner_name(), **values)
-
-
-def threshold(key):
-    return get(f"drempels.{key}")
 
 
 def tag(status) -> str:
@@ -430,6 +496,273 @@ def projects() -> dict:
         entry["db"] = (p.get("db") or {}).get("bestand") if isinstance(p.get("db"), dict) else p.get("db")
         out[p["slug"]] = entry
     return out
+
+
+# Projecten en borden (voorheen team_projects.py): gedeelde alleen-lezen helpers voor de team-cronscripts.
+# Active project = a file in ~/.hermes/team/projects/ (not _TEMPLATE.md) with a line
+# "STATUS: ACTIEF"; no STATUS line means not active. It is linked to Kanban via the projects.db slug (= file name):
+# cards match on project_id or on a workspace path under the project's folder.
+#
+# Boards: every non-archived board under ~/.hermes/kanban/boards/ (the same set the dispatcher walks),
+# except ``default``, which is the archive of the old setup.
+PROJECTS_DIR = HOME / "team" / "projects"
+
+
+def _ro(path: Path):
+    # Eén Hermes-eigenaar (03-10): via connect_ro (na de overstap via de agent, nooit direct).
+    import sqlite3
+    conn = connect_ro(path)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def active_projects(statuses=("ACTIEF",)) -> dict:
+    """``{slug: {"name", "ids", "paths", "status", "file"}}`` for every project file whose STATUS is in ``statuses``."""
+    slugs = {}
+    wanted = "|".join(re.escape(s) for s in statuses)
+    for f in sorted(PROJECTS_DIR.glob("*.md")):
+        if f.name.startswith("_"):
+            continue
+        m = re.search(rf"^\s*STATUS:\s*({wanted})\s*$", f.read_text(encoding="utf-8", errors="replace"), re.M | re.I)
+        if not m:
+            continue
+        slugs[f.stem] = {"name": f.stem, "ids": set(), "paths": [], "status": m.group(1).upper(), "file": f}
+    db = HOME / "projects.db"
+    if slugs and db.exists():
+        conn = _ro(db)
+        for row in conn.execute("SELECT p.slug, p.id, p.name, f.path FROM projects p "
+                                "LEFT JOIN project_folders f ON f.project_id = p.id"):
+            if row["slug"] in slugs:
+                entry = slugs[row["slug"]]
+                entry["name"] = row["name"] or entry["name"]
+                entry["ids"].add(row["id"])
+                if row["path"]:
+                    entry["paths"].append(row["path"].rstrip("/") + "/")
+    return slugs
+
+
+def project_of(task, projects: dict):
+    """Slug of the active project a card belongs to, else None."""
+    workspace = (task["workspace_path"] or "").rstrip("/") + "/"
+    for slug, p in projects.items():
+        if task["project_id"] in p["ids"] or any(workspace.startswith(path) for path in p["paths"]):
+            return slug
+    return None
+
+
+def boards() -> list:
+    """``[(slug, kanban.db path)]`` for every non-archived board except ``default``."""
+    found = []
+    root = HOME / "kanban" / "boards"
+    for d in sorted(root.iterdir(), key=lambda p: p.name.lower()) if root.is_dir() else []:
+        if not d.is_dir() or d.name.startswith("_") or d.name == "default":
+            continue
+        if not ((d / "board.json").exists() or (d / "kanban.db").exists()):
+            continue
+        try:
+            meta = json.loads((d / "board.json").read_text(encoding="utf-8")) if (d / "board.json").exists() else {}
+        except (OSError, ValueError):
+            meta = {}
+        if meta.get("archived") or not (d / "kanban.db").exists():
+            continue
+        found.append((d.name, d / "kanban.db"))
+    return found
+
+
+def kanban(db_path: Path):
+    return _ro(db_path)
+
+
+ALS_AGENT = os.environ.get("HERMES_ALS_AGENT") or "/usr/local/bin/als-agent"
+
+
+def agent_gebruiker() -> str:
+    """De Linux-gebruiker van de agents (``agent.gebruiker``), of "" (vlag uit: oude gedrag)."""
+    value = get("agent.gebruiker")
+    return str(value).strip() if is_set(value) else ""
+
+
+def ben_agent() -> bool:
+    """True als dit proces al als de agent-gebruiker draait (bijv. Hermes-cron in de gateway)."""
+    import pwd
+    return pwd.getpwuid(os.getuid()).pw_name in {agent_gebruiker() or AGENT_STANDAARD, AGENT_STANDAARD}
+
+
+AGENT_STANDAARD = os.environ.get("HERMES_AGENT_USER") or "hermes-agent"
+
+
+def van_agent(pad) -> bool:
+    """True als ``pad`` van de agent-gebruiker is (vanaf Z3 van de overstap, ook als de vlag nog leeg is)."""
+    import pwd
+    try:
+        return pwd.getpwuid(Path(pad).stat().st_uid).pw_name in {agent_gebruiker() or AGENT_STANDAARD, AGENT_STANDAARD}
+    except (OSError, KeyError):
+        return False
+
+
+def via_agent(pad=None) -> bool:
+    """Eén Hermes-eigenaar (besluit eigenaar 03-10): de ops-kant raakt Hermes-bestanden alleen via de agent zodra
+    de vlag aan staat of het bestand al van de agent is. Nooit direct, ook niet alleen-lezen: SQLite maakt anders
+    -wal/-shm als de ops-gebruiker aan en de agent kan daarna niet meer schrijven (bewezen 03-10)."""
+    if ben_agent():
+        return False
+    if pad is not None:  # alleen bestanden van de agent; eigen kopieën van de ops-kant (tests in /tmp) blijven direct
+        return van_agent(pad)
+    return bool(agent_gebruiker()) or van_agent(HOME / "state.db")
+
+
+def als_agent(cmd) -> list:
+    """``cmd`` als de agent: ongewijzigd bij een lege vlag of als we de agent al zijn, anders via als-agent.
+    Let op: als-agent (sudo) neemt de omgeving niet over; geef variabelen mee met ``["env", "X=1", …]``."""
+    if not agent_gebruiker() or ben_agent():
+        return list(cmd)
+    return [ALS_AGENT, *cmd]
+
+
+def als_agent_voor(pad, cmd) -> list:
+    """``cmd`` als de agent alleen als ``pad`` van de agent is (één Hermes-eigenaar); eigen paden van de ops-gebruiker
+    (bijv. testrepo's in /tmp) blijven direct, ook als de vlag aan staat."""
+    if ben_agent() or not van_agent(pad):
+        return list(cmd)
+    return [ALS_AGENT, *cmd]
+
+
+def systemctl_gateway(*args) -> list:
+    """``systemctl --user …`` in de user-manager waar de gateway draait (die van de agent als de vlag aan staat)."""
+    return als_agent(["systemctl", "--user", *args])
+
+
+def systemctl_managers() -> list:
+    """Prefixen voor alle user-managers die de ops-kant bewaakt: die van zichzelf en (vlag aan) die van de agent."""
+    eigen = ["systemctl", "--user"]
+    return [eigen] + ([systemctl_gateway()] if agent_gebruiker() and not ben_agent() else [])
+
+
+class _AgentRow(tuple):
+    """Een rij die op positie én op kolomnaam werkt (zoals sqlite3.Row)."""
+
+    def __new__(cls, waarden, kolommen):
+        rij = super().__new__(cls, waarden)
+        rij._kolommen = list(kolommen)
+        return rij
+
+    def __getitem__(self, sleutel):
+        if isinstance(sleutel, str):
+            return tuple.__getitem__(self, self._kolommen.index(sleutel))
+        return tuple.__getitem__(self, sleutel)
+
+    def keys(self):
+        return list(self._kolommen)
+
+
+class _AgentRows:
+    def __init__(self, rows, kolommen=None):
+        self._rows = [_AgentRow(r, kolommen) if kolommen else tuple(r) for r in rows]
+
+    def fetchone(self):
+        return self._rows[0] if self._rows else None
+
+    def fetchall(self):
+        return list(self._rows)
+
+    def __iter__(self):
+        return iter(self._rows)
+
+
+class _AgentSQL:
+    """Alleen-lezen SQLite via als-agent (scripts/agent_sql.py): voor bestanden die Hermes op 600 zet (state.db).
+    ``row_factory = sqlite3.Row`` mag gezet worden: rijen werken altijd op positie én kolomnaam."""
+
+    row_factory = None
+
+    def __init__(self, db):
+        self.db = str(db)
+
+    def execute(self, sql, params=()):
+        import subprocess
+        r = subprocess.run([ALS_AGENT, "python3", str(SCRIPTS / "agent_sql.py"), self.db, sql,
+                            json.dumps(list(params)), "--met-kolommen"], capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            import sqlite3
+            raise sqlite3.OperationalError(f"agent_sql: exit {r.returncode}: {r.stderr.strip()[-200:]}")
+        uit = json.loads(r.stdout or "{}")
+        return _AgentRows(uit.get("rijen", []), uit.get("kolommen"))
+
+    def close(self):
+        pass
+
+
+def connect_ro(db, timeout=10):
+    """Alleen-lezen verbinding met een SQLite-bestand van Hermes. Is het (of Hermes) van de agent: altijd via
+    als-agent (via_agent), nooit direct. Anders direct (oude stand). Rijen zijn tuples (geen row_factory)."""
+    import sqlite3
+    if via_agent(db):
+        return _AgentSQL(db)
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=timeout)
+        conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+        return conn
+    except sqlite3.Error:
+        if not agent_gebruiker() or ben_agent():
+            raise
+        return _AgentSQL(db)
+
+
+def kopieer_db(src, dst):
+    """Consistente kopie van een live SQLite-database (backup-API, WAL inbegrepen) naar ``dst`` (van de ops-gebruiker).
+    Is de bron van de agent (via_agent): de agent maakt de kopie in een tijdelijke gedeelde map; de ops-gebruiker
+    opent de live database nooit zelf (besluit eigenaar 03-10)."""
+    import shutil
+    import sqlite3
+    import subprocess
+    import tempfile
+    dst = Path(dst)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if not via_agent(src):
+        s, d = sqlite3.connect(f"file:{src}?mode=ro", uri=True, timeout=30), sqlite3.connect(dst)
+        try:
+            s.backup(d)
+        finally:
+            d.close()
+            s.close()
+        return
+    tmp = Path(tempfile.mkdtemp(prefix="hermes-dbkopie-"))
+    try:
+        subprocess.run(["chgrp", "hermes-team", str(tmp)], check=True)
+        tmp.chmod(0o2770)
+        doel = tmp / "kopie.db"
+        code = ("import sqlite3,sys; s=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True,timeout=30); "
+                "d=sqlite3.connect(sys.argv[2]); s.backup(d); d.close(); s.close()")
+        r = subprocess.run([ALS_AGENT, "sh", "-c", 'umask 007; exec python3 -c "$1" "$2" "$3"', "kopie", code,
+                            str(src), str(doel)], capture_output=True, text=True, timeout=300)
+        if r.returncode != 0:
+            raise sqlite3.OperationalError(f"kopie via agent mislukt: {r.stderr.strip()[-200:]}")
+        shutil.copyfile(doel, dst)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def verbruik(provider):
+    """``[(label, procent, resets_at)]`` van een abonnement via ``hermes usage --json`` (wrapper → de agent);
+    ``None`` als het niet op te vragen is."""
+    import subprocess
+    try:
+        r = subprocess.run([hermes_bin(), "usage", "--provider", provider, "--json"], capture_output=True, text=True,
+                           timeout=90)
+        data = json.loads(r.stdout[r.stdout.find("{"):])
+    except Exception:  # noqa: BLE001
+        return None
+    if data.get("unavailable_reason"):
+        return None
+    return [(w.get("label", "?"), float(w.get("used_percent") or 0), w.get("resets_at")) for w in data.get("windows") or []]
+
+
+def abonnementen() -> dict:
+    """``{provider: naam}`` uit ``abonnement.providers``."""
+    prov = get("abonnement.providers")
+    if isinstance(prov, dict) and prov:
+        return {str(k): str(v) for k, v in prov.items()}
+    return {}
 
 
 def channel_ids() -> dict:
@@ -503,6 +836,8 @@ def main(argv):
         print("config OK" + (f" ({config_path()})" if config_path() else " (standaardwaarden)") if not problems
               else "config FOUT:\n- " + "\n- ".join(problems))
         return 1 if problems else 0
+    elif cmd == "als-agent-prefix":
+        print(" ".join(als_agent([])))  # leeg bij vlag uit; anders het pad van als-agent (voor shellscripts)
     elif cmd == "kanalen":
         for k, v in channel_ids().items():
             print(k, v)

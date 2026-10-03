@@ -33,6 +33,7 @@ paden:
   workflow_modus: team/workflow-modus.json # optioneel: {"modus": "opstart" | "rapport", ...}
   workflow_waits: team/workflow-waits.json # optioneel: kaarten die op een systemd-run wachten
   overdracht_chatlog: team/overdracht-chatlog.md   # overdracht bij het nachtelijk vernieuwen van #chatlog
+  discord_archief: ~/hermes-archief-discord   # elk verwijderd Discord-bericht eerst hier (<kanaal>/<jjjj-mm>.jsonl)
 
 bord:
   naam: team        # het Hermes-kanbanbord van het team (hermes kanban --board <naam>)
@@ -47,6 +48,10 @@ rollen:
 
 gateway:
   unit: hermes-gateway.service   # systemd --user unit van de Hermes-gateway
+
+# Linux-gebruiker van de agents (gateway, workers, Hermes-cron). Leeg = alles draait als de huidige gebruiker.
+agent:
+  gebruiker: ""
 
 discord:
   # Rechtsklik in Discord (ontwikkelaarsmodus aan) → "ID kopiëren".
@@ -185,9 +190,8 @@ tijden:
   # Hermes-cron (cron-notatie of "every 30m"); install.sh maakt de jobs hiermee.
   vragen: "*/2 * * * *"
   staging: "*/2 * * * *"
-  vastgelopen: "*/5 * * * *"
   opruimcontrole: "*/10 * * * *"
-  bordbewaking: "*/30 * * * *"
+  bordbewaking: "*/15 * * * *"   # ook de meldingen van vastgelopen en mislukte kaarten
   werkmappen_opruimen: "15 */4 * * *"
   schijfruimte: every 30m
   samenvatting: "0 8 * * *"
@@ -196,6 +200,13 @@ tijden:
   gezondheid: "*:07,37"        # OnCalendar-vorm: minuut 7 en 37 van elk uur
   nachtcontrole: "02:30"
   chatlog_rotatie: "04,05,06:00"
+
+# Modelabonnementen voor het ochtendrapport ("hermes usage --provider <provider>"): provider → naam; leeg = geen regel.
+# Waarschuwen vanaf krap_procent; vanaf stop_procent (week) starten er geen nieuwe kaarten (limiet-poort.py).
+abonnement:
+  providers: {anthropic: Claude, openai-codex: Codex}
+  krap_procent: 70
+  stop_procent: 90
 
 drempels:
   schijf_min_gb: 10                 # minder vrij op / = melding
@@ -208,14 +219,14 @@ drempels:
   werkmap_gesloten_na_uur: 6        # zo lang na done/archived mag een werkmap weg
   review_prioriteit: 10             # review- en eindcontrolekaarten krijgen deze prioriteit (voor nieuwe bouwkaarten)
   review_wacht_min: 15              # … als ze langer dan dit wachten
-  escalatie_uur: 6                  # bordbewaking: staat een afwijking er zo lang na het wekken nog, dan één melding
-  manager_escalatie_uur: 2          # … bij een blokkade die op de manager wacht
-  manager_opnieuw_wekken_min: 60
-  beslissing_manager_wacht_min: 30
+  opnieuw_wekken_uur: 6             # bordbewaking: een afwijking gaat na zoveel uur opnieuw naar de manager (geen melding)
+  blokkade_wek_min: 30              # blokkade zonder voortgang: na zoveel minuten de manager wekken (met draaiboek)
+  blokkade_vraag_uur: 2             # … na zoveel uur zet de manager een vraag in #vragen (blokkades van de eigenaar nooit)
+  manager_opnieuw_wekken_min: 60    # blokkades, wachtkring en codervoorraad: opnieuw wekken na zoveel minuten
+  coder_voorraad_min: 3             # minder coderkaarten klaar of startbaar per actief project = manager plant nu bij
   vraag_zonder_post_min: 15
   ready_zonder_eigenaar_min: 30
   te_lang_running_uur: 3
-  vastgelopen_uur: 6                # onbekende blokkade langer dan dit = "Vastgelopen" in #meldingen
   triage_min: 60
   todo_min: 30
   ready_uur: 2
@@ -243,6 +254,18 @@ gezondheid:
 opruimen:
   overslaan_repos: []    # repo's waarvan de .worktrees nooit worden opgeruimd
   overslaan_namen: []    # werkmapnamen die altijd blijven
+  discord:               # discord-cleanup.py: berichten weg na zoveel dagen, altijd eerst naar paden.discord_archief
+    termijnen_dagen:
+      chatlog: 7
+      vragen: 14           # posts met de tag verwerkt, dagen sinds archivering (hele post weg)
+      meldingen: 3         # alleen "✅ opgelost"; niet-opgeloste blijven altijd staan
+      staging: 14
+      samenvatting: 14
+      workflow-inbox: 7    # alleen doorgestreepte (afgehandelde) berichten
+      gezondheid: 3        # alleen "✅ opgelost"
+    melding_doorgeven_dagen: 14   # een niet-opgeloste melding die ouder is, gaat één keer naar de manager
+    max_per_ronde: 50      # verwijderingen per ronde (elke 10 min); de rest volgt de volgende ronde
+    max_seconden: 60       # tijdsbudget voor het verwijderen per ronde
 
 release:
   # Commando's als lijst; {python} = deze Python, {scripts} = de scriptmap, {nr} en {notitie} = de release.
@@ -274,12 +297,8 @@ teksten:
     compleet: "🏁 [{project}] {niveau} {code} compleet op staging (eindcontrole {eind} klaar)"   # {niveau} Fase/Blok
   vastgelopen:
     vastgelopen: Vastgelopen
-    beslissing_manager: Beslissing manager nodig
     mislukt: "❌ Kaart mislukt: {id} {titel} ({project}) — {waarom}"
     bouwer_onbeschikbaar: "⏸️ Bouwer niet beschikbaar: {aantal} kaart(en) wachten ({kaarten}). Er wordt geen ander model ingezet; ze gaan verder zodra de bouwer weer werkt."
-  bordbewaking:
-    escalatie: "🧭 Bordbewaking: {id} {titel} ({project}) — {waarom}. De manager kreeg dit {uren} uur geleden en het staat er nog."
-    escalatie_manager: "🧭 Kaart {id} {titel} ({project}) wacht al {uren} uur op een beslissing van de manager en ligt stil.\n1. Open #chatlog: {link}\n2. Typ: `Pak eerst de blokkade van {id} op, vóór je planwerk.`\n3. Daarna hoort de manager te antwoorden wat hij besluit, en staat de kaart niet meer op geblokkeerd.\nAntwoord hier alleen met \"gelukt\" of \"niet gelukt\"."
   gezondheid:
     blokkerend: "🔴 {label} faalt sinds {sinds}: {detail}. Projectwerk ligt stil."   # naar #meldingen (ping)
     melding: "⚠️ {label}: {detail} (sinds {sinds})"                                   # naar #gezondheid (stil)
@@ -318,6 +337,13 @@ teksten:
     # Eén regel boven de open punten: aantal open en de datum van het oudste punt.
     inbox_regel: "Workflow-inbox: {aantal} open (oudste: {oudste})"
     inbox_leeg: "Workflow-inbox: niets open"
+    # Opruiming: back-upbranches hermes-backup/<kaart>/<tijd> (patch 3b) gaan 7 dagen na het sluiten van de kaart weg.
+    backup_regel: "- 🗂️ Back-upbranches (niet-vastgelegd werk): {weg} opgeruimd sinds het vorige rapport, {bewaard} bewaard"
+    # Verbruik per modelabonnement (abonnement.providers), uit `hermes usage --json`.
+    abonnement_kop: "**Abonnement**"
+    abonnement_regel: "- {naam} {label}: {procent}% gebruikt (reset {reset})"
+    abonnement_krap: "- ⚠️ {naam}: week boven {drempel}%; bij {stop}% starten er geen nieuwe kaarten meer"
+    abonnement_onbekend: "- verbruik niet op te vragen"
     modusvraag: "❓ Beslissing in de ops-sessie: op {tot} overschakelen naar rapportmodus, of de opstartmodus verlengen?"
     voorstellen:
       # In rapportmodus: het voorgestelde herstel per falende controle.

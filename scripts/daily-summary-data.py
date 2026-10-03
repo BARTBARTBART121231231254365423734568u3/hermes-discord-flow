@@ -3,15 +3,15 @@
 grouped as done yesterday / in progress / stuck. Output is injected into the agent prompt."""
 import json
 import sys
-from datetime import datetime, timedelta
+from datetime import timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import flow_config as fc  # noqa: E402
-from team_projects import active_projects, boards, kanban, project_of  # noqa: E402
+from flow_config import active_projects, boards, kanban, project_of  # noqa: E402
 
 projects = active_projects()
-today = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+today = fc.nu().replace(hour=0, minute=0, second=0, microsecond=0)
 start, end = (today - timedelta(days=1)).timestamp(), today.timestamp()
 groups = {"AF (gisteren)": [], "BEZIG": [], "VAST": []}
 rows = [(conn, t) for _board, db in boards() for conn in [kanban(db)] for t in conn.execute(

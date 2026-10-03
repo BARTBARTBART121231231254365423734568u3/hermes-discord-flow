@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Inventory of card work folders (scratch workspaces, git worktrees) and the growth check.
+"""Inventory of card work folders (scratch workspaces, git worktrees), the cleanup and the growth check.
 
-Previews are abolished (owner decision 30-09): they are no longer created, inventoried or cleaned by default;
-the "preview" kind is only kept for an explicit inventory(kinds=(..., "preview")).
+  werkmap_groei.py [--dry-run]   the cleanup (Hermes cron "Kanban workspace cleanup"; was clean_kanban_workspaces.py)
+  werkmap_groei.py --groei       the growth report as JSON
 
-Used by clean_kanban_workspaces.py and clean_previews.py (what may go) and by hermes-health.py
+Used by the cleanup below (what may go) and by hermes-health.py
 (check ``werkmappen`` via :func:`growth_report`). Everything here is read-only; the removing and
 archiving helpers at the bottom only act when a cleanup script calls them in real mode.
 
@@ -14,18 +14,37 @@ Where things live:
   git worktrees       <repo>/.worktrees/<task_id> for every repo in projects.db (project_folders), every
                       folder under the projects folder (flow config paden.projecten_map) and every repo a card's
                       workspace_path points into; the repo of the live Hermes install (~/.hermes/hermes-agent) and the
-                      repos in opruimen.overslaan_repos are skipped entirely;
-  previews            HERMES_PREVIEWS_DIR (default ~/AppData/Local/hermes/previews/<16 hex>), linked to a card
-                      only when a board mentions ``/preview/<id>`` (task body/result, comments, events, runs).
+                      repos in opruimen.overslaan_repos are skipped entirely.
 
 Card status comes from EVERY board DB (also archived boards and the legacy archive board
 <HERMES_HOME>/kanban.db). A folder may go only when
-  - all cards it belongs to (card id = folder name, plus cards whose workspace_path points at it, plus cards that
-    mention the preview) are done/archived for more than 24 h, or
+  - all cards it belongs to (card id = folder name, plus cards whose workspace_path points at it) are
+    done/archived for more than 24 h, or
   - none of those cards exists on any board any more and the folder's newest file is older than 7 days.
 Any open card (todo/ready/running/review/blocked/triage/other) keeps it. Names that are not a card id,
-``live-*`` and the names in opruimen.overslaan_namen are 'onbekend, overgeslagen'. Locked worktrees, folders that
-are some process's working directory and previews named in ~/.hermes/team/**/*.md are kept too.
+``live-*`` and the names in opruimen.overslaan_namen are 'onbekend, overgeslagen'. Locked worktrees and folders that
+are some process's working directory are kept too.
+
+The cleanup (no-agent cron script, Hermes cron "Kanban workspace cleanup", deliver local): removes the work folders of
+finished cards — scratch workspaces of every board and git worktrees under <repo>/.worktrees/<task_id>.
+
+Rules:
+  - only folders whose card(s) are done/archived for > 6 h (CLOSED_GRACE) on any board (team board, other boards and the
+    legacy archive board ~/.hermes/kanban.db), or whose card exists nowhere any more and whose newest file is
+    older than 7 days; an open card (todo/ready/running/review/blocked/triage) always keeps its folder;
+  - never: the live Hermes repo and opruimen.overslaan_repos (whole repo), .worktrees/live-*, opruimen.overslaan_namen, locked worktrees,
+    folders that are a process's working directory, names that are not a card id ('onbekend, overgeslagen');
+  - git worktree: with changes, first `git diff HEAD --binary` → .patch and untracked files (without
+    node_modules/.next/dist/build/__pycache__) → tar.gz in ~/hermes-archief-<YYYYMMDD>/werkmappen/ (dir 700,
+    files 600) + an INDEX line (card, branch, commit); then `git worktree remove --force` + `git worktree prune`.
+    Branches are never deleted; a detached HEAD with commits on no branch is skipped;
+  - scratch workspace / orphan folder under .worktrees (no longer a registered worktree): tar.gz into the archive
+    (without the regenerable folders) when it holds any other file, then remove.
+Skips the whole run while a drain restart runs (~/.hermes/state/drain.json).
+``--dry-run`` prints every decision and planned action and changes nothing.
+Real mode logs to ~/.hermes/logs/clean_kanban_workspaces.log; stdout gets one summary line only when something
+was removed or failed (empty stdout = nothing to do). The log and the output keep the old name
+``clean_kanban_workspaces`` (CLEANUP_NAME).
 """
 import json
 import os
@@ -36,36 +55,32 @@ import subprocess
 import sys
 import tarfile
 import time
-from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import flow_config as fc  # noqa: E402
-from team_projects import HOME, kanban  # noqa: E402
+import flow_config as fc  # noqa: E402  (git in agentrepo's: als de agent, vlag agent.gebruiker)
+from flow_config import HOME, kanban  # noqa: E402
 
 WORKSPACE = Path(os.environ.get("HERMES_WORKSPACE_PROJECTS") or fc.expand(fc.get("paden.projecten_map"), Path.home()))
-PREVIEWS_DIR = Path(os.environ.get("HERMES_PREVIEWS_DIR") or Path(
-    os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local") / "hermes" / "previews")
 ARCHIVE_ROOT = Path(os.environ.get("HERMES_ARCHIEF_ROOT") or fc.expand(fc.get("paden.archief_root"), Path.home()))
 DRAIN = HOME / "state" / "drain.json"
 
 DAY = 86400
 CLOSED_GRACE = int(fc.get("drempels.werkmap_gesloten_na_uur") * 3600)  # done/archived for longer → may go
-REMOVE_CARDLESS = False  # never remove folders/previews that no card refers to (owner decision 30-09)
-MISSING_AGE = 7 * DAY         # card gone everywhere and folder older than this → may go
 LEFTOVER_MISSING_AGE = DAY    # growth check: counts a card-less folder as leftover after 24 h
 LEFTOVER_MAX = int(fc.get("drempels.werkmappen_resten_max"))
 TOTAL_MAX = int(fc.get("drempels.werkmappen_totaal_max_gb") * 1024 ** 3)
-PREVIEW_TAR_MIN = 50 * 1024 ** 2
 ARCHIVE_RESERVE = 5 * 1024 ** 3  # keep this much free on the archive disk after tarring
+BACKUP_PREFIX = "hermes-backup/"  # fork patch 3b: uncommitted work secured as hermes-backup/<card>/<utc-ts>
+BACKUP_KEEP = 7 * DAY             # such a branch goes once its card is done/archived for longer than this
+BACKUP_STATE = HOME / "state" / "backup-branches.jsonl"
 
 CLOSED = {"done", "archived"}
 CARD_RE = re.compile(r"^t_[0-9a-f]{8}$")
-PREVIEW_RE = re.compile(r"^[0-9a-f]{16}$")
-PREVIEW_REF = re.compile(r"/preview/([0-9a-f]{16})")
 SKIP_NAMES = set(fc.get("opruimen.overslaan_namen") or [])
 SKIP_REPOS = set(fc.get("opruimen.overslaan_repos") or [])
 REGENERABLE = {"node_modules", ".next", "dist", "build", "__pycache__"}  # never archived
+CLEANUP_NAME = "clean_kanban_workspaces"  # log ~/.hermes/logs/<name>.log and the stdout prefix (unchanged since the merge)
 
 
 # ------------------------------------------------------------------ cards
@@ -88,23 +103,19 @@ def _basename(path: str) -> str:
     return re.split(r"[\\/]", (path or "").rstrip("\\/"))[-1]
 
 
-def _cols(conn, table) -> set:
-    return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
-
-
 def load_cards() -> dict:
-    """``{"cards": {id: {status, closed_at, boards}}, "by_dir": {folder name: {ids}}, "previews": {id: {ids}}}``.
+    """``{"cards": {id: {status, closed_at, boards}}, "by_dir": {folder name: {ids}}}``.
 
     A card on several boards counts as open when it is open anywhere; closed_at is the latest of completed_at,
     the last event and the last run end (conservative: the later, the longer it is kept)."""
-    cards, by_dir, previews = {}, {}, {}
+    cards, by_dir = {}, {}
     for board, db in board_dbs():
         conn = kanban(db)
         try:
             last_event = dict(conn.execute("SELECT task_id, MAX(created_at) FROM task_events GROUP BY task_id"))
             last_run = dict(conn.execute("SELECT task_id, MAX(COALESCE(ended_at, started_at)) FROM task_runs "
                                          "GROUP BY task_id"))
-            for t in conn.execute("SELECT id, status, completed_at, workspace_path, body, result FROM tasks"):
+            for t in conn.execute("SELECT id, status, completed_at, workspace_path FROM tasks"):
                 closed = max(t["completed_at"] or 0, last_event.get(t["id"]) or 0, last_run.get(t["id"]) or 0)
                 c = cards.setdefault(t["id"], {"status": t["status"], "closed_at": 0, "boards": []})
                 c["boards"].append(board)
@@ -115,33 +126,11 @@ def load_cards() -> dict:
                 c["closed_at"] = max(c["closed_at"], closed)
                 if t["workspace_path"]:
                     by_dir.setdefault(_basename(t["workspace_path"]), set()).add(t["id"])
-                for text in (t["body"], t["result"]):
-                    for pid in PREVIEW_REF.findall(text or ""):
-                        previews.setdefault(pid, set()).add(t["id"])
-            sources = [("task_comments", "body"), ("task_events", "payload"), ("task_runs", "summary"),
-                       ("task_runs", "metadata")]
-            for table, col in sources:
-                if col not in _cols(conn, table):
-                    continue
-                for row in conn.execute(f"SELECT task_id, {col} FROM {table} WHERE {col} LIKE '%/preview/%'"):
-                    for pid in PREVIEW_REF.findall(row[1] or ""):
-                        previews.setdefault(pid, set()).add(row[0])
         except sqlite3.Error as exc:
             raise RuntimeError(f"bord {board} ({db}) niet leesbaar: {exc}") from exc
         finally:
             conn.close()
-    return {"cards": cards, "by_dir": by_dir, "previews": previews}
-
-
-def team_doc_previews() -> set:
-    """Preview ids named in ~/.hermes/team/**/*.md (e.g. a design reference in a project file): always kept."""
-    found = set()
-    for f in (HOME / "team").rglob("*.md") if (HOME / "team").is_dir() else []:
-        try:
-            found |= set(PREVIEW_REF.findall(f.read_text(encoding="utf-8", errors="replace")))
-        except OSError:
-            pass
-    return found
+    return {"cards": cards, "by_dir": by_dir}
 
 
 # ------------------------------------------------------------------ folders
@@ -216,7 +205,8 @@ def repos() -> list:
 
 
 def git(args, cwd, timeout=120):
-    return subprocess.run(["git", "-C", str(cwd)] + args, capture_output=True, text=True, timeout=timeout)
+    return subprocess.run(fc.als_agent_voor(cwd, ["git", "-C", str(cwd)] + args), capture_output=True, text=True,
+                          timeout=timeout)
 
 
 def registered_worktrees(repo: Path) -> dict:
@@ -259,7 +249,7 @@ def _in_use(path: Path, busy) -> bool:
     return any(b == real or b.startswith(real + os.sep) for b in busy)
 
 
-def decide(ids, info, newest, now, missing_age=MISSING_AGE):
+def decide(ids, info, newest, now):
     """('weg' | 'blijft', reason) for a folder that belongs to card ids ``ids``."""
     cards = info["cards"]
     known = sorted(i for i in ids if i in cards)
@@ -273,14 +263,12 @@ def decide(ids, info, newest, now, missing_age=MISSING_AGE):
             return "weg", f"kaart {', '.join(known)} {cards[known[0]]['status']} sinds {days:.1f} dag"
         return "blijft", f"kaart {', '.join(known)} pas gesloten (< {CLOSED_GRACE // 3600} uur)"
     age = (now - newest) / DAY if newest else 0
-    if REMOVE_CARDLESS and newest and now - newest > missing_age:
-        return "weg", f"kaart bestaat niet meer, map {age:.0f} dagen oud"
     # Owner decision 30-09: only folders of done/archived cards are removed; a folder without a known card is reported only.
     return "blijft", f"geen bekende kaart (map {age:.1f} dag oud): alleen gemeld, niet opgeruimd"
 
 
-def inventory(kinds=("werkmap", "worktree"), now=None, missing_age=MISSING_AGE, info=None) -> list:
-    """One dict per folder: kind (werkmap | worktree | wees | preview), path, name, card ids, size, newest,
+def inventory(kinds=("werkmap", "worktree"), now=None, info=None) -> list:
+    """One dict per folder: kind (werkmap | worktree | wees), path, name, card ids, size, newest,
     decision (weg | blijft | onbekend), reason; worktrees also repo, branch, head, detached."""
     now = now or time.time()
     info = info or load_cards()
@@ -296,7 +284,7 @@ def inventory(kinds=("werkmap", "worktree"), now=None, missing_age=MISSING_AGE, 
         elif _in_use(path, busy):
             item["decision"], item["reason"] = "blijft", "map in gebruik door een proces"
         else:
-            item["decision"], item["reason"] = decide(ids, info, newest, now, missing_age)
+            item["decision"], item["reason"] = decide(ids, info, newest, now)
         items.append(item)
         return item
 
@@ -332,20 +320,6 @@ def inventory(kinds=("werkmap", "worktree"), now=None, missing_age=MISSING_AGE, 
                     item["reason"] = "vaste werkmap (live/patch), overgeslagen"
                 elif reg and reg["locked"] and item["decision"] == "weg":
                     item["decision"], item["reason"] = "blijft", "worktree is gelocked"
-
-    if "preview" in kinds and PREVIEWS_DIR.is_dir():
-        named = team_doc_previews()
-        for d in sorted(PREVIEWS_DIR.iterdir()):
-            if not d.is_dir() or d.is_symlink():
-                continue
-            ids = info["previews"].get(d.name, set())
-            item = add("preview", d, ids, card_named=bool(PREVIEW_RE.match(d.name)))
-            if item["decision"] == "onbekend":
-                item["reason"] = "naam is geen preview-id, overgeslagen"
-            elif d.name in named:  # a preview named in a project file is kept and is no leftover
-                item["decision"], item["reason"] = "blijft", "genoemd in ~/.hermes/team (projectbestand)"
-            elif not ids:
-                item["reason"] = item["reason"].replace("kaart bestaat niet meer", "geen kaart noemt deze preview")
     return items
 
 
@@ -354,10 +328,10 @@ def gb(n) -> str:
 
 
 def growth_report(now=None, items=None) -> dict:
-    """Totals for the health check: size of card workspaces + worktrees + previews (live: real disk use, hardlinks
+    """Totals for the health check: size of card workspaces + worktrees (live: real disk use, hardlinks
     once), the leftovers (folders of done/archived cards > CLOSED_GRACE, or card-less > 24 h) and the 5 largest."""
     live = items is None
-    items = items if items is not None else inventory(now=now, missing_age=LEFTOVER_MISSING_AGE)
+    items = items if items is not None else inventory(now=now)
     per_kind = {}
     for i in items:
         per_kind[i["kind"]] = per_kind.get(i["kind"], 0) + i["size"]
@@ -391,7 +365,7 @@ def drain_running() -> bool:
 
 
 def archive_dir(now=None) -> Path:
-    base = ARCHIVE_ROOT / f"hermes-archief-{datetime.fromtimestamp(now or time.time()).strftime('%Y%m%d')}"
+    base = ARCHIVE_ROOT / f"hermes-archief-{fc.tijd(now or None, '%Y%m%d')}"
     d = base / "werkmappen"
     d.mkdir(parents=True, exist_ok=True)
     os.chmod(base, 0o700)
@@ -404,7 +378,7 @@ def _private(path: Path):
 
 
 def index_line(adir: Path, **fields):
-    line = "\t".join([datetime.now().isoformat(timespec="seconds")] + [f"{k}={v}" for k, v in fields.items()])
+    line = "\t".join([fc.nu().isoformat(timespec="seconds")] + [f"{k}={v}" for k, v in fields.items()])
     idx = adir / "INDEX"
     with idx.open("a") as fh:
         fh.write(line + "\n")
@@ -413,7 +387,7 @@ def index_line(adir: Path, **fields):
 
 def _stamp(item) -> str:
     repo = item.get("repo")
-    return f"{item['kind']}-{repo.name + '-' if repo else ''}{item['name']}-{datetime.now().strftime('%H%M%S')}"
+    return f"{item['kind']}-{repo.name + '-' if repo else ''}{item['name']}-{fc.tijd(None, '%H%M%S')}"
 
 
 def _room_for(adir: Path, size: int) -> bool:
@@ -432,10 +406,11 @@ def has_keepable_files(path: Path) -> bool:
     return False
 
 
-def tar_dir(path: Path, dest: Path, exclude_regenerable=True):
-    """tar.gz of ``path`` (symlinks stored as links), verified by reading it back; chmod 600."""
+def tar_dir(path: Path, dest: Path):
+    """tar.gz of ``path`` (symlinks stored as links, regenerable folders left out), verified by reading it back;
+    chmod 600."""
     def flt(ti):
-        if exclude_regenerable and any(p in REGENERABLE for p in Path(ti.name).parts[1:]):
+        if any(p in REGENERABLE for p in Path(ti.name).parts[1:]):
             return None
         return ti
     with tarfile.open(dest, "w:gz") as tf:
@@ -454,7 +429,7 @@ def remove_plain(item, adir: Path, *, want_tar: bool) -> str:
         if not _room_for(adir, item["size"]):
             raise RuntimeError("te weinig schijfruimte voor het archief")
         dest = adir / f"{_stamp(item)}.tar.gz"
-        tar_dir(path, dest, exclude_regenerable=item["kind"] != "preview")
+        tar_dir(path, dest)
         note = f"archief {dest.name}"
     shutil.rmtree(path)
     index_line(adir, soort=item["kind"], kaart=",".join(item["cards"]) or "-", pad=path, actie=note)
@@ -477,7 +452,8 @@ def remove_worktree(item, adir: Path) -> str:
         stamp = _stamp(item)
         if not _room_for(adir, item["size"]):
             raise RuntimeError("te weinig schijfruimte voor het archief")
-        diff = subprocess.run(["git", "-C", str(wt), "diff", "HEAD", "--binary"], capture_output=True, timeout=120)
+        diff = subprocess.run(fc.als_agent_voor(wt, ["git", "-C", str(wt), "diff", "HEAD", "--binary"]), capture_output=True,
+                              timeout=120)
         if diff.returncode != 0:
             raise RuntimeError("git diff faalt")
         if diff.stdout:
@@ -485,7 +461,7 @@ def remove_worktree(item, adir: Path) -> str:
             p.write_bytes(diff.stdout)
             _private(p)
             saved.append(p.name)
-        ls = subprocess.run(["git", "-C", str(wt), "ls-files", "--others", "--exclude-standard", "-z"],
+        ls = subprocess.run(fc.als_agent_voor(wt, ["git", "-C", str(wt), "ls-files", "--others", "--exclude-standard", "-z"]),
                             capture_output=True, timeout=120)
         if ls.returncode != 0:
             raise RuntimeError("git ls-files faalt")
@@ -510,6 +486,66 @@ def remove_worktree(item, adir: Path) -> str:
     return "wijzigingen bewaard: " + ", ".join(saved) if saved else "schoon"
 
 
+def backup_branches(info=None, now=None) -> list:
+    """Backup branches of fork patch 3b in every project repo, each with a decision:
+    ``weg`` when its card is done/archived for longer than BACKUP_KEEP, else ``blijft`` (open card, recently
+    closed, or a card that exists nowhere: those are only reported)."""
+    info = info or load_cards()
+    now = now or time.time()
+    out = []
+    for repo in repos():
+        r = git(["for-each-ref", "--format=%(refname:short) %(objectname)", f"refs/heads/{BACKUP_PREFIX}"], repo)
+        for line in (r.stdout or "").splitlines():
+            ref, _, sha = line.strip().partition(" ")
+            parts = ref.split("/")
+            card = parts[1] if len(parts) >= 3 else ""
+            c = info["cards"].get(card)
+            if c and c["status"] in CLOSED and now - c["closed_at"] > BACKUP_KEEP:
+                decision, why = "weg", f"kaart {card} {c['status']} sinds {(now - c['closed_at']) / DAY:.1f} dag"
+            elif c and c["status"] in CLOSED:
+                decision, why = "blijft", f"kaart {card} pas gesloten (< {BACKUP_KEEP // DAY} dagen)"
+            elif c:
+                decision, why = "blijft", f"kaart {card} open ({c['status']})"
+            else:
+                decision, why = "blijft", "geen bekende kaart: alleen gemeld"
+            out.append({"repo": repo, "ref": ref, "sha": sha, "card": card, "decision": decision, "reason": why})
+    return out
+
+
+def remove_backup(b, adir: Path) -> str:
+    """Archive the backup commit as a patch (600) with an INDEX line, then delete the branch."""
+    patch = adir / f"backup-{b['ref'].replace('/', '_')}.patch"
+    r = subprocess.run(fc.als_agent_voor(b["repo"], ["git", "-C", str(b["repo"]), "format-patch", "-1", "--stdout", "--binary", b["sha"]]),
+                       capture_output=True, timeout=120)
+    if r.returncode != 0 or not r.stdout:
+        raise RuntimeError(f"format-patch mislukt: {r.stderr.decode(errors='replace')[-200:]}")
+    patch.write_bytes(r.stdout)
+    _private(patch)
+    index_line(adir, soort="back-upbranch", kaart=b["card"], pad=f"{b['repo']}:{b['ref']}", commit=b["sha"][:12],
+               actie=f"archief {patch.name}")
+    d = git(["branch", "-D", b["ref"]], b["repo"])
+    if d.returncode != 0:
+        raise RuntimeError(f"branch -D mislukt: {(d.stderr or '').strip()[-200:]}")
+    return f"gearchiveerd als {patch.name}, branch weg"
+
+
+def record_backups(gone: int, kept: int, failed: int, now=None):
+    BACKUP_STATE.parent.mkdir(parents=True, exist_ok=True)
+    with BACKUP_STATE.open("a") as fh:
+        fh.write(json.dumps({"at": now or time.time(), "weg": gone, "bewaard": kept, "fout": failed}) + "\n")
+
+
+def backup_summary(since: float):
+    """(removed since ``since``, kept at the last run) from BACKUP_STATE, or None without data."""
+    try:
+        rows = [json.loads(l) for l in BACKUP_STATE.read_text().splitlines() if l.strip()]
+    except (OSError, ValueError):
+        return None
+    if not rows:
+        return None
+    return sum(r.get("weg", 0) for r in rows if r.get("at", 0) > since), rows[-1].get("bewaard", 0)
+
+
 def plan(item) -> str:
     """What a real run would do with a 'weg' item (read-only; used by --dry-run and the log)."""
     if item["kind"] == "worktree":
@@ -523,19 +559,13 @@ def plan(item) -> str:
         n = len(st.stdout.splitlines())
         keep = f"eerst {n} wijziging(en) bewaren (patch + untracked tar.gz), " if n else ""
         return f"{keep}git worktree remove --force + prune (branch {item.get('branch') or '(los)'} blijft)"
-    if want_tar(item):
+    if has_keepable_files(item["path"]):
         return "tar.gz naar archief, dan map weg"
     return "map weg (geen archief nodig)"
 
 
-def want_tar(item) -> bool:
-    if item["kind"] == "preview":
-        return item["size"] > PREVIEW_TAR_MIN
-    return has_keepable_files(item["path"])
-
-
 def run_cleanup(script: str, kinds, argv) -> int:
-    """Shared main of clean_kanban_workspaces.py and clean_previews.py."""
+    """Main of the cleanup (``werkmap_groei.py [--dry-run]``)."""
     dry = "--dry-run" in argv
     log = Logger(script, dry)
     if drain_running():
@@ -559,6 +589,9 @@ def run_cleanup(script: str, kinds, argv) -> int:
             print(f"         → {plan(i)}")
         for i in unknown + kept:
             report_items([i], log)
+        if "worktree" in kinds:
+            for b in backup_branches(load_cards(), now):
+                print(f"{b['decision']:<8} back-upbranch {b['repo'].name}:{b['ref']} — {b['reason']}")
         return 0
     adir = archive_dir(now) if gone else None
     done, archived, failed, freed = 0, 0, [], 0
@@ -568,10 +601,7 @@ def run_cleanup(script: str, kinds, argv) -> int:
             failed.append(f"{i['name']} (drain)")
             break
         fresh = load_cards()  # the card may have been reopened while earlier items were archived
-        if i["kind"] != "preview":
-            ids = set(i["cards"]) | fresh["by_dir"].get(i["name"], set())
-        else:
-            ids = set(i["cards"]) | fresh["previews"].get(i["name"], set())
+        ids = set(i["cards"]) | fresh["by_dir"].get(i["name"], set())
         verdict, why = decide(ids, fresh, i["newest"], time.time())
         if verdict != "weg" or _in_use(i["path"], busy_dirs()):
             log(f"blijft alsnog: {i['path']} ({why})")
@@ -581,7 +611,7 @@ def run_cleanup(script: str, kinds, argv) -> int:
                 note = remove_worktree(i, adir)
                 archived += note.startswith("wijzigingen")
             else:
-                note = remove_plain(i, adir, want_tar=want_tar(i))
+                note = remove_plain(i, adir, want_tar=has_keepable_files(i["path"]))
                 archived += note.startswith("archief")
             done += 1
             freed += i["size"]
@@ -591,8 +621,22 @@ def run_cleanup(script: str, kinds, argv) -> int:
             log(f"FOUT: {i['path']}: {type(exc).__name__}: {exc}")
     for i in unknown:
         log(f"onbekend, overgeslagen: {i['path']}")
-    if done or failed:
-        parts = [f"{done} weg ({gb(freed)})"]
+    b_done = b_kept = 0
+    if "worktree" in kinds:  # backup branches of fork patch 3b (owner decision: away 7 days after the card closed)
+        for b in backup_branches(load_cards(), time.time()):
+            if b["decision"] != "weg":
+                b_kept += 1
+                continue
+            try:
+                adir = adir or archive_dir(now)
+                log(f"weg: back-upbranch {b['repo']}:{b['ref']} — {b['reason']} — {remove_backup(b, adir)}")
+                b_done += 1
+            except Exception as exc:  # noqa: BLE001
+                failed.append(b["ref"])
+                log(f"FOUT: back-upbranch {b['ref']}: {type(exc).__name__}: {exc}")
+        record_backups(b_done, b_kept, sum(1 for f in failed if f.startswith(BACKUP_PREFIX)), now)
+    if done or failed or b_done:
+        parts = [f"{done} weg ({gb(freed)})"] + ([f"{b_done} back-upbranch(es) weg"] if b_done else [])
         if archived:
             parts.append(f"{archived} gearchiveerd in {adir}")
         if unknown:
@@ -609,12 +653,7 @@ class Logger:
         self.dry = dry
 
     def __call__(self, line: str):
-        if self.dry:
-            print(line)
-            return
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("a") as fh:
-            fh.write(f"{datetime.now().isoformat(timespec='seconds')} {line}\n")
+        fc.log(self.path, line, echo=self.dry, schrijf=not self.dry)
 
 
 def report_items(items, log):
@@ -624,5 +663,7 @@ def report_items(items, log):
 
 
 if __name__ == "__main__":
-    r = growth_report()
-    print(json.dumps(r, indent=1, ensure_ascii=False))
+    if "--groei" in sys.argv[1:]:
+        print(json.dumps(growth_report(), indent=1, ensure_ascii=False))
+    else:
+        sys.exit(run_cleanup(CLEANUP_NAME, ("werkmap", "worktree"), sys.argv[1:]))

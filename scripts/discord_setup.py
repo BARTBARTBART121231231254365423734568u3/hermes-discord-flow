@@ -4,7 +4,7 @@
 Layout (from the flow config: discord.categorieen + discord.kanalen; the default, top to bottom):
   GENERAL        #chatlog                    conversations owner ↔ manager (gateway home channel)
   HERMES AGENTS  #vragen (forum, ping)       one post per question, buttons, tags open/beantwoord/verwerkt + project
-                 #meldingen (ping)           stuck cards, beslissing manager, phase complete, gateway down/unexpected restart
+                 #meldingen (ping)           stuck or failed cards, phase complete, gateway down/unexpected restart
                  #staging (silent)           one line per card on staging
                  #samenvatting (silent)      daily summary 08:00
   WORKFLOW       #ochtendrapport (1 ping/day) morning report of the workflow side; on Monday the weekly incident overview
@@ -26,7 +26,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import discord_post as dp  # noqa: E402
 import flow_config as fc  # noqa: E402
-from team_projects import active_projects  # noqa: E402
+from flow_config import active_projects  # noqa: E402
 
 TEXT, CATEGORY, FORUM = 0, 4, 15
 SEND_MESSAGES = 1 << 11  # in a forum: start a post

@@ -28,7 +28,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import discord_post as dp  # noqa: E402
 import flow_config as fc  # noqa: E402
-from team_projects import HOME, PROJECTS_DIR, active_projects, boards, kanban, project_of  # noqa: E402
+from flow_config import HOME, PROJECTS_DIR, active_projects, boards, kanban, project_of  # noqa: E402
 
 STATE = HOME / "state" / "staging-announced.json"
 PHASES = HOME / "state" / "staging-phases.json"

@@ -24,7 +24,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import flow_config as fc  # noqa: E402
-from team_projects import HOME  # noqa: E402
+from flow_config import HOME  # noqa: E402
 
 API = os.environ.get("FLOW_DISCORD_API") or "https://discord.com/api/v10"
 CHANNELS = fc.path("discord_ids")
@@ -48,7 +48,13 @@ def _token() -> str:
     return m.group(1).strip().strip("'\"") if m else ""
 
 
-def api(method: str, path: str, body=None):
+class RateLimited(RuntimeError):
+    """429 with a retry_after longer than the caller wants to wait (``max_wait``)."""
+
+
+def api(method: str, path: str, body=None, max_wait=None):
+    """One REST call; a 429 waits retry_after and retries (twice). ``max_wait``: a longer wait raises RateLimited
+    instead (a budgeted round stops and continues next time)."""
     data = json.dumps(body).encode() if body is not None else None
     for attempt in range(3):
         req = urllib.request.Request(API + path, data=data, method=method, headers={
@@ -60,7 +66,10 @@ def api(method: str, path: str, body=None):
                 return json.loads(raw) if raw else None
         except urllib.error.HTTPError as e:
             if e.code == 429 and attempt < 2:
-                time.sleep(float(json.loads(e.read() or b"{}").get("retry_after", 2)) + 0.5)
+                wait = float(json.loads(e.read() or b"{}").get("retry_after", 2))
+                if max_wait is not None and wait > max_wait:
+                    raise RateLimited(f"Discord {method} {path}: 429, retry_after {wait:.0f}s") from e
+                time.sleep(wait + 0.5)
                 continue
             raise RuntimeError(f"Discord {method} {path}: HTTP {e.code} {e.read()[:300]!r}") from e
     return None

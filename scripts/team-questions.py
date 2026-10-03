@@ -43,10 +43,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import discord_post as dp  # noqa: E402
 import flow_config as fc  # noqa: E402
-from team_projects import HOME, active_projects, boards, kanban, project_of  # noqa: E402
+from flow_config import HOME, active_projects, boards, kanban, project_of  # noqa: E402
 
 PREFIX = fc.question_prefix().lower()
-STATE = HOME / "state" / "questions-sent.json"
 POSTS = HOME / "state" / "questions-posts.json"
 HERMES = fc.hermes_bin()
 T = fc.get("teksten.vraag")
@@ -315,13 +314,6 @@ def remove_buttons(p, owner=""):
                 "allowed_mentions": {"parse": []}})
 
 
-def waiting_cards():
-    try:
-        return set(json.loads(fc.path("workflow_waits").read_text()))
-    except (OSError, ValueError):
-        return set()
-
-
 def is_wait_status(q):
     """A "Wacht op …" reason is a wait state, not a question. A card that waits on a workflow run
     (workflow-waits.json) can still get a NEW real question: that one is posted like any other."""
@@ -417,10 +409,6 @@ def main():
     forum, owner = ch["vragen"], ch.get("owner", "")
     posts = json.loads(POSTS.read_text() or "{}") if POSTS.exists() else {}
     posts = {k: v for k, v in posts.items() if "thread" in v and k.count(":") == 1}  # per card: "board:task"
-    for old in json.loads(STATE.read_text() or "[]") if STATE.exists() else []:  # migrate old episode keys
-        board, task, event = old.split(":")
-        if not dp.event_seen(f"{task}:vraag:{event}"):
-            dp.event_mark(f"{task}:vraag:{event}", migrated=True)
     open_eps = set()
     for q in questions:
         if is_wait_status(q):

@@ -14,6 +14,7 @@ import argparse
 import json
 import re
 import threading
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -48,7 +49,8 @@ def tags_with_ids(tags):
 def make_message(channel_id, body, author=None):
     msg = {"id": new_id(), "channel_id": channel_id, "content": body.get("content", ""),
            "components": body.get("components", []), "flags": body.get("flags", 0),
-           "allowed_mentions": body.get("allowed_mentions"), "author": {"id": author or STATE["bot"], "bot": not author}}
+           "allowed_mentions": body.get("allowed_mentions"), "author": {"id": author or STATE["bot"], "bot": not author},
+           "timestamp": datetime.now(timezone.utc).isoformat(), "pinned": False}
     STATE["messages"].setdefault(channel_id, []).append(msg)
     return msg
 
@@ -95,11 +97,16 @@ def route(method, path, query, body):  # noqa: C901 (one small router)
             return err(404, 10003, "Unknown Channel")
         if rest == "" and method == "GET":
             return 200, c
+        if rest == "" and method == "DELETE":
+            STATE["messages"].pop(cid, None)
+            return 200, STATE["channels"].pop(cid)
         if rest == "" and method == "PATCH":
             if c["type"] == 11:
                 md = c["thread_metadata"]
                 if md["locked"] and body.get("locked") is not False and set(body) - {"archived", "locked"}:
                     return err(403, 50083, "Thread is locked")
+                if "archived" in body and bool(body["archived"]) != md["archived"]:
+                    md["archive_timestamp"] = datetime.now(timezone.utc).isoformat()  # zoals Discord
                 for k in ("archived", "locked"):
                     if k in body:
                         md[k] = bool(body[k])
@@ -136,7 +143,8 @@ def route(method, path, query, body):  # noqa: C901 (one small router)
             return 200, make_message(cid, body)
         if rest == "/messages" and method == "GET":
             limit = int(query.get("limit", ["50"])[0])
-            return 200, list(reversed(STATE["messages"].get(cid, [])))[:limit]
+            before = int(query.get("before", ["0"])[0])
+            return 200, [x for x in reversed(STATE["messages"].get(cid, [])) if not before or int(x["id"]) < before][:limit]
         m3 = re.fullmatch(r"/messages/(\w+)/reactions/([^/]+)/@me", rest)
         if m3 and method == "PUT":
             msg = next((x for x in STATE["messages"].get(cid, []) if x["id"] == m3.group(1)), None)
@@ -151,6 +159,9 @@ def route(method, path, query, body):  # noqa: C901 (one small router)
                 return err(404, 10008, "Unknown Message")
             if method == "GET":
                 return 200, msg
+            if method == "DELETE":
+                STATE["messages"][cid].remove(msg)
+                return 204, None
             if method == "PATCH":
                 for k in ("content", "components", "flags"):
                     if k in body:

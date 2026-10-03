@@ -3,8 +3,8 @@
 #
 # Gebruik: ./install.sh [--dry-run] [--basis] [--met-chatlog] [--geen-systemd] [--geen-cron]
 #   --dry-run       laat alleen zien wat er zou gebeuren; verandert niets
-#   --basis         alleen de basis: vragen, meldingen, staging, samenvatting (+ gateway-wachter)
-#                   (zonder: ook de extra's: ochtendrapport, gezondheid, nachtcontrole/releases, bordbewaking, opruiming)
+#   --basis         alleen de basis: vragen, meldingen + bordbewaking, staging, samenvatting (+ gateway-wachter)
+#                   (zonder: ook de extra's: ochtendrapport, gezondheid, nachtcontrole/releases, opruiming)
 #   --met-chatlog   ook de nachtelijke #chatlog-vernieuwing (chatlog-rotate.py) installeren
 #   --geen-systemd  geen systemd-units schrijven of aanzetten
 #   --geen-cron     geen Hermes-cronjobs maken
@@ -149,7 +149,7 @@ if [ "$CRON" = 1 ]; then
   }
   job "Vraag van het team" "$(cfg tijden.vragen)" team-questions.py local
   job "Staging klaar" "$(cfg tijden.staging)" staging-announce.py local
-  job "Vastgelopen-check" "$(cfg tijden.vastgelopen)" kanban-stuck-check.py local
+  job "Bordbewaking" "$(cfg tijden.bordbewaking)" board-guard.py local  # ook vastgelopen/mislukte kaarten (#meldingen)
   job "Discord-opruimcontrole" "$(cfg tijden.opruimcontrole)" discord-cleanup.py local
   if [ -n "$(chan samenvatting)" ]; then
     job "Dagelijkse samenvatting" "$(cfg tijden.samenvatting)" daily-summary-data.py "discord:$(chan samenvatting)" \
@@ -158,13 +158,7 @@ if [ "$CRON" = 1 ]; then
     say "LET OP: #samenvatting heeft nog geen ID — draai discord_setup.py en daarna install.sh opnieuw"
   fi
   if [ "$BASIS" = 0 ]; then
-    job "Bordbewaking" "$(cfg tijden.bordbewaking)" board-guard.py local
-    job "Kanban workspace cleanup" "$(cfg tijden.werkmappen_opruimen)" clean_kanban_workspaces.py local
-    if [ -n "$(chan meldingen)" ]; then
-      job "Schijfruimte" "$(cfg tijden.schijfruimte)" disk_space_watch.py "discord:$(chan meldingen)"
-    else
-      say "LET OP: #meldingen heeft nog geen ID — draai discord_setup.py en daarna install.sh opnieuw"
-    fi
+    job "Kanban workspace cleanup" "$(cfg tijden.werkmappen_opruimen)" werkmap_groei.py local
   fi
 else
   say "cron overgeslagen (--geen-cron)"

@@ -21,13 +21,13 @@ Log: ~/.hermes/logs/flow-controle.log.
 """
 import json
 import os
-import py_compile
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 
 sys.dont_write_bytecode = True
@@ -66,21 +66,11 @@ def run(cmd, timeout=240, input=None, cwd=None, shell=False):
         return 124, "", f"timeout na {timeout} s"
 
 
-def last(text):
-    lines = [l for l in (text or "").splitlines() if l.strip()]
-    return lines[-1].strip()[:200] if lines else "(geen uitvoer)"
+last = partial(fc.last_line, limit=200)
 
 
 def check_compile():
-    files = sorted(SCRIPTS.glob("*.py"))
-    bad = []
-    with tempfile.TemporaryDirectory() as tmp:
-        for f in files:
-            try:
-                py_compile.compile(str(f), cfile=str(Path(tmp) / (f.stem + ".pyc")), doraise=True)
-            except py_compile.PyCompileError as e:
-                bad.append(f"{f.name}: {last(str(e))}")
-    return not bad, f"{len(files) - len(bad)}/{len(files)} scripts compileren" + (f"; FOUT {'; '.join(bad)}" if bad else "")
+    return fc.check_compile(sorted(SCRIPTS.glob("*.py")), limit=200)
 
 
 def check_config():

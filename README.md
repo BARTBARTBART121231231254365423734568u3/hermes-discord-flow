@@ -23,7 +23,7 @@ De flow heeft twee lagen. Begin met de **basis**; de **extra's** kun je later aa
 | Kanaal | Soort | Melding | Wat staat erin | Door |
 |---|---|---|---|---|
 | **#vragen** | forum | ping | Eén post per vraag van het team aan jou: de aanbevolen optie bovenaan als groene knop met ⭐, de andere opties als knop, en **✏️ Anders…** (opent een invulveld). Labels: project en **open** → **beantwoord** → **verwerkt**. | `team-questions.py` (elke 2 min) |
-| **#meldingen** | tekst | ping | Alleen projectwerk dat stilligt: vastgelopen of mislukte kaarten, "beslissing manager", blok of fase compleet, gateway plat. Is het voorbij, dan wordt het bericht "✅ opgelost". | `kanban-stuck-check.py`, `staging-announce.py`, `gateway-watch.py`, `discord-cleanup.py` |
+| **#meldingen** | tekst | ping | Alleen projectwerk dat stilligt: vastgelopen of mislukte kaarten, blok of fase compleet, gateway plat. Is het voorbij, dan wordt het bericht "✅ opgelost". | `board-guard.py`, `staging-announce.py`, `gateway-watch.py`, `discord-cleanup.py` |
 | **#staging** | tekst | stil | Eén regel per kaart die op staging staat. | `staging-announce.py` (elke 2 min) |
 | **#samenvatting** | tekst | stil | De dagelijkse samenvatting (08:00): af, bezig, vast, meting. | Hermes-cron met `daily-summary-data.py` + de manager |
 | **#chatlog** | tekst | normaal | Je gesprekken met de manager (het "home channel" van de gateway). Hier staan nooit vragen die jij moet beslissen. | gateway |
@@ -55,7 +55,7 @@ stateDiagram-v2
 | **WORKFLOW → #releases** | tekst | stil | Eén regel per workflow-release, alleen als de controle groen is. | `hermes-release.py --notitie "…"` |
 | **WORKFLOW → #workflow-inbox** | tekst | stil | Eén bericht per punt in de workflow-inbox met "Status: open"; afgehandeld = hetzelfde bericht doorgestreept met "✅ Afgehandeld …". | `workflow-inbox.py` (na elke gezondheidscheck) |
 | — | — | — | **Bordbewaking**: zoekt afwijkingen op het bord (vraag zonder post, blokkade zonder reden, kaart zonder project, …) en wekt de manager stil. Staat het er na 6 uur nog, dan één melding in #meldingen. | `board-guard.py` (elk half uur) |
-| — | — | — | **Opruiming en groeicontrole**: werkmappen en git-worktrees van afgeronde kaarten gaan weg (eerst gearchiveerd als er iets in staat); de gezondheidscheck meldt als ze te groot worden. | `clean_kanban_workspaces.py`, `werkmap_groei.py` |
+| — | — | — | **Opruiming en groeicontrole**: werkmappen en git-worktrees van afgeronde kaarten gaan weg (eerst gearchiveerd als er iets in staat), en back-upbranches `hermes-backup/<kaart>/<tijd>` (optionele patch 3b) 7 dagen nadat de kaart klaar is; het ochtendrapport noemt het aantal. De gezondheidscheck meldt als de werkmappen te groot worden. | `werkmap_groei.py` |
 | — | — | — | **Vraagcontrole alleen voor echte vragen**: `team-questions.py` neemt alleen `needs_input`-blokkades mee die met het vraagvoorvoegsel beginnen (of op een "Beslissing: …"-kaart staan). Andere `needs_input`-blokkades (bijv. "kleurplaat onduidelijk" of een preflight van Hermes) laat hij liggen; de bordbewaking meldt ze aan de manager als **blokkade-voor-manager**. | `team-questions.py`, `board-guard.py` |
 | — | — | — | **Status per vraag**: `team-status.py` toont per project de open kaarten met hun reden van nu, en of een vraag "BEANTWOORD, WORDT VERWERKT" is. De manager gebruikt dit voor elk statusoverzicht. | `team-status.py` |
 
@@ -82,7 +82,6 @@ flowchart LR
     subgraph Scripts["scripts (cron en systemd, zonder model)"]
       Q[team-questions.py]
       S[staging-announce.py]
-      K[kanban-stuck-check.py]
       C[discord-cleanup.py]
       W[gateway-watch.py]
       BG[board-guard.py]
@@ -105,11 +104,11 @@ flowchart LR
     V -- "knop / Anders…" --> G --> M --> B
     B --> S --> ST
     S -- "fase compleet" --> ME
-    B --> K --> ME
     C -- "✅ opgelost / verwerkt" --> ME & V
     W --> ME
     B --> BG -- "stil wekken" --> M
-    BG -- "na 6 uur" --> ME
+    BG -- "vastgelopen / mislukt" --> ME
+    M -- "blokkade > 2 u: vraag" --> V
     M -- "08:00" --> SA
     H --> GZ
     H -- "werk ligt stil" --> ME
@@ -127,9 +126,11 @@ Alle namen, teksten, tijden en drempels staan in één config: [`config.example.
 - **Een Discord-server** waarvan jij eigenaar bent.
 - **Een Discord-bot** (Developer Portal → Applications → New Application → Bot):
   - **Privileged Gateway Intents:** zet **Message Content Intent** aan (verplicht: de gateway leest je berichten). Server Members Intent is alleen nodig als je in Hermes toegestane gebruikers op naam opgeeft.
-  - **Rechten** bij het uitnodigen (OAuth2 → URL Generator, scopes `bot` en `applications.commands`): View Channels, Send Messages, Send Messages in Threads, Create Public Threads, Manage Threads, Read Message History, Embed Links, Attach Files, Add Reactions, Use Application Commands, Manage Channels, Manage Roles en Manage Server. Als getal: **`328833551472`**. Manage Server en Manage Roles zijn nodig voor de inrichting (Community aanzetten, kanaalrechten); daarna mag je ze weer weghalen.
+  - **Rechten** bij het uitnodigen (OAuth2 → URL Generator, scopes `bot` en `applications.commands`): View Channels, Send Messages, Send Messages in Threads, Create Public Threads, Manage Threads, Read Message History, Embed Links, Attach Files, Add Reactions, Use Application Commands, Manage Messages (voor de bewaartermijnen: oude berichten verwijderen), Manage Channels, Manage Roles en Manage Server. Als getal: **`328833559664`**. Manage Server en Manage Roles zijn nodig voor de inrichting (Community aanzetten, kanaalrechten); daarna mag je ze weer weghalen.
   - Het **token** zet je als `DISCORD_BOT_TOKEN=…` in `~/.hermes/.env` (nooit in git).
   - De ID's (server, jouw account) kopieer je in Discord met de ontwikkelaarsmodus aan: rechtsklik → "ID kopiëren".
+
+> **Let op (patches):** dit pakket bevat de patchset in `patches/`. Nieuwere fork-patches (o.a. de herstartgrens) zitten er nog niet in. Geen enkel script heeft ze nodig; alleen de regel "geparkeerd door de herstartgrens" in het ochtendrapport telt gebeurtenissen van die patch en staat zonder de patch altijd op 0.
 
 ## Zelf installeren
 
@@ -195,16 +196,15 @@ De automatische versie van deze lijst, met een nep-Discord en zonder echte gegev
 | `scripts/discord_post.py` | Discord-REST: forumposts met labels en knoppen, stille berichten, archiveren; `discord_post.py meldingen "tekst"`. |
 | `scripts/team-questions.py` | De vragenflow: validatie (`--check`), posts, knoppen, labels, advies wijzigen (`--advies`). |
 | `scripts/staging-announce.py` | #staging per kaart; "fase compleet" in #meldingen met een productievraag in #vragen. |
-| `scripts/kanban-stuck-check.py` | Vastgelopen of mislukte kaarten, "beslissing manager", bouwer niet beschikbaar. |
-| `scripts/discord-cleanup.py` | Posts van afgeronde kaarten sluiten, opgeloste meldingen op "✅ opgelost". |
+| `scripts/discord-cleanup.py` | Posts van afgeronde kaarten sluiten, opgeloste meldingen op "✅ opgelost"; bewaartermijnen per kanaal (`opruimen.discord`): oude berichten eerst naar het archief (`paden.discord_archief`), dan weg. |
 | `scripts/daily-summary-data.py` | De gegevens voor de dagelijkse samenvatting. |
-| `scripts/gateway-watch.py`, `gateway-planned-restart.sh`, `drain-restart.py` | Gateway-wachter, geplande herstart, veilige herstart via drain. |
+| `scripts/gateway-watch.py`, `drain-restart.py` | Gateway-wachter, geplande herstart (`drain-restart.py --gepland`), veilige herstart via drain. |
 | `scripts/team-status.py` | Live status per project, met de stand van elke vraag. |
-| `scripts/board-guard.py` | Bordbewaking (extra). |
+| `scripts/board-guard.py` | Bordbewaking: wekt de manager (blokkades, wachtkring, codervoorraad, …) en meldt vastgelopen of mislukte kaarten en een onbeschikbare bouwer in #meldingen. |
 | `scripts/hermes-health.py` | Gezondheidscheck (extra). |
 | `scripts/hermes-ochtendrapport.py` | Ochtendrapport (extra). |
 | `scripts/hermes-release.py`, `scripts/flow-controle.py` | Release met controle vooraf; de controle draait ook elke nacht (extra). |
-| `scripts/werkmap_groei.py`, `scripts/clean_kanban_workspaces.py`, `scripts/disk_space_watch.py` | Opruiming, groeicontrole en schijfruimte (extra). |
+| `scripts/werkmap_groei.py`  | Opruiming (`werkmap_groei.py`, `--groei` voor het groeirapport), groeicontrole en schijfruimte (extra). |
 | `scripts/chatlog-rotate.py` | Nachtelijke nieuwe #chatlog-sessie (optioneel). |
 | `scripts/scan_personal.py` | Zoekt persoonlijke gegevens en geheimen vóór je iets deelt. |
 | `systemd/` | De units (`%h` = je thuismap); `install.sh` vult de tijden uit de config in. |

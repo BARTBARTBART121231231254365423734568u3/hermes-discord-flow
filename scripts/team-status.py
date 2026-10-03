@@ -22,7 +22,7 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import flow_config as fc  # noqa: E402
-from team_projects import HOME, active_projects, boards, kanban, project_of  # noqa: E402
+from flow_config import HOME, active_projects, boards, kanban, project_of  # noqa: E402
 
 NL = fc.tz()
 OWNER = fc.owner_name()
@@ -63,9 +63,10 @@ def nl_time(stamp):
 def question_state(conn, task_id, blocked_reason):
     """For a card blocked on a question to the owner: 'open' or 'beantwoord, wordt verwerkt' (he clicked or typed an
     answer in the #vragen post, but the manager has not yet put it on the card). None when it is no question."""
-    row = conn.execute("SELECT block_kind FROM tasks WHERE id = ?", (task_id,)).fetchone()
-    if not (blocked_reason.lower().startswith(PREFIX) or (row and row[0] == "needs_input"
-                                                                         and not blocked_reason.lower().startswith("wacht op"))):
+    # Alleen een echte vraag (reden begint met het vraag-voorvoegsel), zoals team-questions.py: een needs_input die
+    # Hermes zelf maakte uit een afhankelijkheid zonder open parent (rekind no_open_parent) is GEEN vraag aan de
+    # eigenaar (inbox 20261003-0057: "beslissing manager: wacht op …" stond als open vraag).
+    if not blocked_reason.lower().startswith(PREFIX):
         return None
     ev = conn.execute("SELECT created_at FROM task_events WHERE task_id = ? AND kind = 'blocked' ORDER BY id DESC LIMIT 1",
                       (task_id,)).fetchone()
@@ -76,7 +77,7 @@ def question_state(conn, task_id, blocked_reason):
         thread = None
     if thread:
         try:
-            s = sqlite3.connect(f"file:{HOME / 'state.db'}?mode=ro", uri=True, timeout=5)
+            s = fc.connect_ro(HOME / "state.db", timeout=5)  # state.db is 600 van de agent (vlag aan)
             hit = s.execute("SELECT 1 FROM messages m JOIN sessions x ON x.id = m.session_id WHERE x.session_key LIKE ? "
                             "AND m.role = 'user' AND m.timestamp > ? LIMIT 1", (f"%:thread:{thread}:%", since)).fetchone()
             if hit:

@@ -10,7 +10,7 @@ Vink af in deze volgorde. Lukt een stap niet, stop dan en stuur terug wat ondera
 
 ## Discord-bot
 - [ ] Bot aangemaakt, **Message Content Intent** aan.
-- [ ] Bot uitgenodigd met scopes `bot` + `applications.commands` en rechten **`328833551472`** (of tijdelijk Administrator).
+- [ ] Bot uitgenodigd met scopes `bot` + `applications.commands` en rechten **`328833559664`** (inclusief Manage Messages voor de bewaartermijnen) (of tijdelijk Administrator).
 - [ ] `DISCORD_BOT_TOKEN` staat in `~/.hermes/.env` (niet in git, niet in een chat geplakt).
 - [ ] Ontwikkelaarsmodus aan; server-ID en je eigen gebruikers-ID gekopieerd.
 
@@ -25,7 +25,7 @@ Vink af in deze volgorde. Lukt een stap niet, stop dan en stuur terug wat ondera
 - [ ] `~/.hermes/team/flow.yaml` ingevuld (guild_id, owner_id, eigenaar.naam, vragen.prefix, projecten) en `python3 ~/.hermes/scripts/flow_config.py check` zegt `config OK`.
 - [ ] `python3 ~/.hermes/scripts/discord_setup.py --dry-run`, daarna zonder `--dry-run`: de categorieën en kanalen staan in Discord, #vragen is een forum met de labels open/beantwoord/verwerkt.
 - [ ] Discord-deel van `~/.hermes/config.yaml` overgenomen uit `docs/hermes-config-discord.yaml` (ID's uit `~/.hermes/team/discord.json`), gateway herstart.
-- [ ] `./install.sh` opnieuw (met of zonder `--basis`): `hermes cron list` toont "Vraag van het team", "Staging klaar", "Vastgelopen-check", "Discord-opruimcontrole" en "Dagelijkse samenvatting".
+- [ ] `./install.sh` opnieuw (met of zonder `--basis`): `hermes cron list` toont "Vraag van het team", "Staging klaar", "Bordbewaking", "Discord-opruimcontrole" en "Dagelijkse samenvatting".
 - [ ] Blok A en B uit `docs/manager-instructies.md` staan in TEAM.md en de SOUL van de manager.
 - [ ] Minstens één projectbestand met `STATUS: ACTIEF`.
 

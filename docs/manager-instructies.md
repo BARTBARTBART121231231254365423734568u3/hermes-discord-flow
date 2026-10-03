@@ -43,7 +43,7 @@ Wat niet in deze lijst staat, wordt niet gepost. Meldingen post niemand zelf; da
 | Kanaal | Alleen dit | Door |
 |---|---|---|
 | #vragen (forum, ping) | Projectvragen aan <eigenaar>, één post per kaart, met knoppen | team-questions.py |
-| #meldingen (ping) | kaart vastgelopen, "beslissing manager", kaart mislukt, bouwer niet beschikbaar, blok of fase compleet, bordbewaking na 6 uur, gateway plat of onverwacht herstart, schijfruimte laag | scripts; is het voorbij, dan "✅ opgelost" |
+| #meldingen (ping) | kaart vastgelopen (tijd), kaart mislukt, bouwer niet beschikbaar, blok of fase compleet, gateway plat of onverwacht herstart, schijfruimte laag | scripts; is het voorbij, dan "✅ opgelost" |
 | #staging (stil) | Eén regel per kaart die op staging staat | staging-announce.py |
 | #samenvatting (stil) | De dagelijkse samenvatting van de actieve projecten | cron + manager |
 | #chatlog | Gesprekken tussen <eigenaar> en de manager. Nooit vragen die <eigenaar> moet beslissen | manager |
@@ -54,8 +54,7 @@ Wat niet in deze lijst staat, wordt niet gepost. Meldingen post niemand zelf; da
 - Een workflowopdracht of -fout wordt **één bestand** in `~/.hermes/workflow-inbox/` (vorm in `LEESMIJ.md` daar). Dus geen kaart en geen melding.
 
 ### Bewaking (scripts, zonder model)
-- **Bordbewaking** (elk half uur): wekt de manager stil bij een afwijking. Staat die er na 6 uur nog, dan volgt één melding. Blokkades die op een beslissing van de manager wachten, gaan vóór zijn eigen planwerk: na 2 uur volgt één actiebericht.
-- **Vastgelopen-check** (elke 5 min): alleen tijdsignalen (triage, todo die niet start, ready met een vrije plek, "beslissing manager", een onbekende blokkade langer dan 6 uur, een mislukte kaart).
+- **Bordbewaking** (elke 15 min): wekt de manager stil, één keer per project met alle open punten samen (minstens 30 min ertussen, behalve bij een nieuw kleurplaat-, maximum- of kringpunt; niet als er al een managerrun van dat project loopt); opnieuw na 6 uur; geen melding. Een blokkade met een datum die nog niet voorbij is, telt niet mee. Eén regel voor elke blokkade van een actief project: een vraag aan de eigenaar staat al in #vragen en telt niet mee; andere blokkades zonder voortgang (de kaart waarop gewacht wordt loopt niet en kreeg het afgelopen uur geen run, event of commentaar) wekken de manager na 30 minuten met een draaiboek, en na 2 uur zet de manager een vraag in #vragen met wat al geprobeerd is. Een wachtkring tussen kaarten breekt hij zelf (reviewer vóór security, anders de oudste). Minder dan 3 startbare coderkaarten bij een open plan: de manager plant de eerstvolgende 3 (max 1x per uur). In #meldingen alleen tijdsignalen (triage, todo die niet start, ready met een vrije plek) en mislukte kaarten.
 - **Status altijd live:** een statusoverzicht komt uit `team-status.py`, nooit uit eerdere gespreksinhoud.
 
 ---
@@ -96,7 +95,7 @@ Elke post in #vragen hoort bij één kaart (het id staat in de titel).
 - In een wachtreden ("Wacht op …") staan geen voortgangsgetallen of eindtijden; alleen waarop de kaart wacht en welk antwoord erbij hoort.
 
 ### Bordbewaking
-`board-guard.py` wekt je stil in een CLI-sessie. Post niets in Discord. Los per afwijking de projectkant op (bijvoorbeeld: vraag-zonder-post → opnieuw blokkeren in het juiste format; zonder-reden → reden zetten of deblokkeren; oude-vraag → de wachtstand herschrijven; zonder-project → kaart opnieuw maken met `--project <slug>`). Een workflowfout zet je als bestand in `~/.hermes/workflow-inbox/`.
+`board-guard.py` wekt je stil in een CLI-sessie. Post niets in Discord (behalve een vraag aan de eigenaar via een kaartblokkade). Los per afwijking de projectkant op (bijvoorbeeld: vraag-zonder-post → opnieuw blokkeren in het juiste format; zonder-reden → reden zetten of deblokkeren; oude-vraag → de wachtstand herschrijven; zonder-project → kaart opnieuw maken met `--project <slug>`; blokkade → het draaiboek in de wektekst; blokkade-vraag → een vraag in het vraagformat; voorraad-laag → de eerstvolgende 3 bouwkaarten plannen). Een workflowfout zet je als bestand in `~/.hermes/workflow-inbox/`.
 
 ## Blokkades die geen vraag aan de eigenaar zijn
 

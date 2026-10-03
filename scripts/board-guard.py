@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Board guard (cron, --no-agent, every 30 min). Layer 1 = this script, no model; layer 2 = the manager, only
-when something is wrong. Checks the Team board for:
+"""Board guard (cron, --no-agent, every 15 min; since 03-10 also the former kanban-stuck-check.py). Layer 1 = this
+script, no model; layer 2 = the manager, only when something is wrong. Checks the Team board for:
 
   vraag-zonder-post   blocked on the owner (title "Beslissing: …", needs_input or the question prefix) but no
                       #vragen post for the current block after 15 min
@@ -13,9 +13,22 @@ when something is wrong. Checks the Team board for:
   kleurplaat-onduidelijk  the builder blocked with "kleurplaat onduidelijk: …" (no waiting time)
   verkeerd-maximum    a "te groot (N regels … max X)" block whose X is not the limit in the kleurplaat's "Maximale
                       grootte" line (the builder invented his own limit, 01-10)
-  beslissing-manager  blocked with "beslissing manager" for more than 30 min
   blokkade-voor-manager  blocked with needs_input but the reason is no owner question (e.g. "worker preflight: …");
                       team-questions.py leaves it alone since 01-10, so the manager must solve it
+  blokkade / blokkade-vraag  one rule for every block of an ACTIEF project (owner decision 03-10). Owner from the
+                      reason: the question prefix → the owner (already in #vragen: never escalated; the morning
+                      report lists them after 24 h); "Wacht op … <kaart-id>" → the role of that card; else the
+                      manager. No progress (the awaited card – else the card itself – is not running and had no run,
+                      event or comment in the last hour; an open workflow-inbox item named in the reason counts as
+                      progress) → after 30 min "blokkade" (wake text with a playbook per sort), after 2 h
+                      "blokkade-vraag" (the manager asks the owner in #vragen with what was tried; workflow matters go
+                      to the inbox). A reason with a date (ISO or dd-mm) that has not passed yet does not count.
+                      Replaces "beslissing-manager", the 6-hour message and the stuck-check ping.
+  wachtkring          2+ blocked cards whose reasons name each other's id: the card that goes first (reviewer before
+                      security, else the oldest) is unblocked with a note, and the manager is told
+  voorraad-laag       an ACTIEF project has < 3 coder cards that are ready or can start (todo with every parent
+                      done) while a plan card (-00) or a todo manager card (not -99/review/decision) is open, and no
+                      manager card of that project is running: plan the next 3 build cards now (max 1x per hour)
   inloggegevens-in-kleurplaat  an open card's body contains a credential pattern in a URL (":$PGPASSWORD@",
                       ":***@"): builders copy it with the redacted *** (incident 01-10); use the test wrapper
   afhankelijkheid-zonder-reden  an open card waits on an open predecessor (task_links) without a line naming that
@@ -31,15 +44,21 @@ when something is wrong. Checks the Team board for:
   geen-fasenplan      GEPAUZEERD project with a finished intake card, but no docs/PHASES.md in the repo (working
                       tree or any git branch) and no open card that writes it ("F0-00", "Fasenplan", "PHASES")
 
-Projects with STATUS ACTIEF or GEPAUZEERD (zonder-project: every open card). When there are anomalies that were
-not handed to the manager in the last 6 hours, the manager is woken silently in a CLI session with the list
-(no Discord output); he fixes the project side himself, and turns a workflow fault into a "workflow: …" card
-(no message; SOUL). An anomaly that is still there 6 hours after the manager got it is reported
-once in #meldingen. Blocks that wait on a manager decision (kleurplaat-onduidelijk, verkeerd-maximum,
-beslissing-manager) go before his own plan work: the manager is woken again every hour and after 2 hours there is
-one action message in #meldingen (owner decision 01-10, after a pilot run waited 7.5 hours). State in the event register (discord-events.json): "guard:<kaart>:<soort>".
+Projects with STATUS ACTIEF or GEPAUZEERD (zonder-project: every open card). The manager is woken silently in a CLI
+session with the list (no Discord output); he fixes the project side himself, and turns a workflow fault into a
+workflow-inbox file. Blocks, the cycle and the coder supply go before his own plan work: woken again every hour;
+other anomalies every 6 hours. One wake-up per project per round with all its due items (most urgent first), at
+least 30 min apart unless a new kleurplaat/maximum/cycle item came in, never while a manager card of it runs. Nothing of this goes to #meldingen any more. A card blocked on a workflow-inbox item
+(file name in the reason) that is in workflow-inbox/afgehandeld/ is unblocked with a note.
+#meldingen (with ping, ACTIEF projects, was kanban-stuck-check.py; one message per episode, discord-cleanup.py marks
+it "✅ opgelost"): triage > 1 h; todo with every parent done and not started 30 min after the last one finished;
+ready > 2 h while a worker slot for its assignee is free for 10+ min ("since" = the card's last non-comment event);
+a card in the workflow-waits file (paden.workflow_waits, {"<task_id>": {"unit": "<unit>"}}) once its unit failed or
+finished while the card is still blocked; runs that crashed, timed out or gave up (24 h) as "❌ Kaart mislukt"; a
+builder that is unavailable (quota, 429…) as ONE message per 6 hours. State in the event register
+(discord-events.json): "guard:<kaart>:<soort>", "<kaart>:vastgelopen:<status>:<sinds>", "<kaart>:mislukt:<event>".
 Personal values (board, roles, thresholds, texts, the allowed model override) come from the flow config.
-``--dry-run`` lists the anomalies and changes nothing. Log: ~/.hermes/logs/board-guard.log.
+``--dry-run`` lists everything and changes nothing. Log: ~/.hermes/logs/board-guard.log.
 """
 import json
 import re
@@ -52,10 +71,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import discord_post as dp  # noqa: E402
 import flow_config as fc  # noqa: E402
-from team_projects import HOME, active_projects, boards, kanban, project_of  # noqa: E402
+from flow_config import HOME, active_projects, boards, kanban, project_of  # noqa: E402
 
 D = fc.get("drempels")
-REPEAT = int(D["escalatie_uur"] * 3600)
+REPEAT = int(D["opnieuw_wekken_uur"] * 3600)
 VERVOLG_SINCE = int(fc.get("bordbewaking.regels_sinds.vervolg") or 0)  # follow-up rule in force (older decisions are not checked)
 VERVOLG_GRACE = 15 * 60
 UNPOSTED_AFTER = int(D["vraag_zonder_post_min"] * 60)
@@ -68,6 +87,7 @@ BOARD = fc.get("bord.naam")
 OWNER = fc.owner_name()
 PREFIX = fc.question_prefix().lower().rstrip(":")
 BUILDER = fc.get("rollen.bouwer")
+MANAGER = fc.get("rollen.manager")
 CHECKERS = set(fc.get("rollen.controleurs"))
 ALLOWED_OVERRIDES = set(fc.get("bordbewaking.toegestane_model_override") or [])
 
@@ -91,7 +111,9 @@ PLAN_CARD = re.compile(r"\bF0-00\b|fasenplan|PHASES", re.I)
 NO_NEXT_STEP = re.compile(r"^\s*GEEN VOLGENDE STAP:\s*\S", re.M)
 PLAN_CODE = re.compile(r"^\s*(F\d+[A-Z]?)-00\b")
 KLEURPLAAT = re.compile(r"^#\s*Kleurplaat\b", re.M | re.I)
-PLACEHOLDER = re.compile(r"kleurplaat\s+(?:wordt|volgt)\b.*?(?:geschreven|nog)|plaatshouder", re.I)
+# A real placeholder only: "kleurplaat wordt/volgt … geschreven/nog", or a line that starts with "Plaatshouder" — not the
+# word inside a normal sentence ("geen plaatshouderteksten" in Randgevallen gave a false alarm, 01-10).
+PLACEHOLDER = re.compile(r"kleurplaat\s+(?:wordt|volgt)\b.*?(?:geschreven|nog)|^\s*[-*>]?\s*(?:\*\*)?plaatshouder\b", re.I | re.M)
 UNAVAILABLE = re.compile(r"(?i)quota|rate.?limit|\b429\b|\b503\b|overloaded|unavailable|capacity|usage limit|exhausted|"
                          r"insufficient|credits|no available|not available")
 CODER_CAP = int((fc.get("rollen.max_per_rol") or {}).get(BUILDER, 1))  # dispatcher caps (TEAM.md "Parallel werken")
@@ -107,10 +129,31 @@ MAX_LINES = re.compile(r"Maximale grootte[^\n]*?(\d{2,4})\s*regels", re.I)
 DEFAULT_MAX_LINES = int(D["kleurplaat_max_regels"])
 OVER_LIMIT = 1.2  # > 20% over the kleurplaat limit (TEAM.md "Maximale grootte vooraf")
 TOO_BIG = re.compile(r"te groot\s*\(\s*~?(\d{2,5})\s*regels?[^)]*?\bmax(?:imaal|imum)?\.?\s*~?(\d{2,5})", re.I)
-MANAGER_KINDS = {"kleurplaat-onduidelijk", "verkeerd-maximum", "beslissing-manager", "blokkade-voor-manager"}  # before his own plan work
+SPECIFIC_BLOCKS = {"kleurplaat-onduidelijk", "verkeerd-maximum", "blokkade-voor-manager"}  # woken at once
+MANAGER_KINDS = SPECIFIC_BLOCKS | {"blokkade", "blokkade-vraag", "wachtkring", "voorraad-laag"}  # before his plan work
 MANAGER_REWAKE = int(D["manager_opnieuw_wekken_min"] * 60)
-MANAGER_ESCALATE = int(D["manager_escalatie_uur"] * 3600)
-DECISION_WAIT = int(D["beslissing_manager_wacht_min"] * 60)
+BLOCK_WAKE = int(D["blokkade_wek_min"] * 60)
+BLOCK_ASK = int(D["blokkade_vraag_uur"] * 3600)
+SUPPLY_MIN = int(D["coder_voorraad_min"])
+BUNDLE_GAP = 30 * 60  # one wake-up per project per round, at least this long apart …
+DIRECT = {"kleurplaat-onduidelijk", "verkeerd-maximum", "wachtkring"}  # … unless one of these is new
+URGENCY = ["wachtkring", "kleurplaat-onduidelijk", "verkeerd-maximum", "blokkade-voor-manager", "blokkade-vraag",
+           "blokkade", "mislukt-2x", "voorraad-laag"]  # order in the wake text; the rest after these
+DATE = re.compile(r"\b(?:(20\d\d)-(\d\d)-(\d\d)|(\d{1,2})-(\d{1,2})(?:-(20\d\d))?)\b")
+CARD_ID = re.compile(r"\bt_[0-9a-f]{8}\b")
+INBOX = fc.path("workflow_inbox")
+INBOX_ITEM = re.compile(r"\b(\d{8}-\d{4}-[A-Za-z0-9-]*[A-Za-z0-9])(?:\.md)?")
+ACCESS = re.compile(r"(?i)toegang|login|inlog|account|wachtwoord|credential|token|rechten|permission|access|database|"
+                    r"\bdb\b|omgeving|environment|preflight|worktree|server|railway|secret|vapid")
+NO_PROGRESS = ("blocked", "commented", "heartbeat", "reprioritized", "dependency_wait", "block_loop_detected",
+               "rate_limited", "respawn_guarded", "spawn_failed", "gave_up")  # events that are no progress
+PLAYBOOK = {  # R2 (owner 03-10): what the manager does per sort of block, short, in the wake text
+    "kleurplaat": "kleurplaat onduidelijk: vul de kleurplaat aan (edit --body) en deblokkeer, of splits de kaart",
+    "kaart": "wacht op een kaart: trek die kaart vlot (waarom staat hij stil?); daarna gaat deze vanzelf verder",
+    "toegang": "toegang/omgeving: zet het als bestand in de workflow-inbox en blokkeer met 'Wacht op "
+               "workflow-inboxpunt <bestandsnaam>'",
+    "overig": "deblokkeer, of zet de echte reden ('Wacht op <kaart-id> …', of een vraag in het vraagformat)",
+}
 CRED_IN_URL = re.compile(r"://\$?\{?\w+\}?:(?:\$\{?\w+\}?|\*\*\*)@")
 DEPS_SINCE = int(fc.get("bordbewaking.regels_sinds.afhankelijkheden") or 0)  # dependency-reason rule in force
 DEP_EXEMPT_ASSIGNEES = CHECKERS
@@ -127,6 +170,28 @@ def diff_lines(paths, branch):
         nums = re.findall(r"(\d+) (?:insertion|deletion)", out)
         if out.strip():
             return sum(int(n) for n in nums)
+    return None
+
+
+def pinned_projects() -> set:
+    """Project ids whose model the fork pins itself (config.yaml kanban.project_models, fork patch 10)."""
+    try:
+        import yaml
+        cfg = yaml.safe_load((HOME / "config.yaml").read_text()) or {}
+        return set(((cfg.get("kanban") or {}).get("project_models") or {}).keys())
+    except Exception:  # noqa: BLE001
+        return set()
+
+
+PINNED = pinned_projects()
+
+
+def project_model(slug, role=None):
+    """The fixed model of a project (flow config projecten[].model: rollen.<role> or standaard), or None."""
+    for p in fc.get("projecten") or []:
+        if p.get("slug") == slug and isinstance(p.get("model"), dict):
+            m = (p["model"].get("rollen") or {}).get(role) or p["model"].get("standaard") or {}
+            return m.get("model") or None
     return None
 
 
@@ -223,13 +288,25 @@ def decision_checks(conn, projects, intake_done, now):
     return found
 
 
-def project_checks(projects, open_cards, intake_done, work=None, capacity=None):
+# Een expliciete pauze door de eigenaar (notitie "Pauze op verzoek …" of "PAUZE: …" in het projectbestand) gaat vóór
+# een eerder fasenplan-akkoord: dan nooit oproepen tot ACTIEF (inbox 20261002-0732).
+EXPLICIT_PAUSE = re.compile(r"(?im)^\s*(?:<!--\s*)?(?:pauze\s+op\s+verzoek|pauze\s*:)")
+
+
+def project_checks(projects, open_cards, intake_done, work=None, capacity=None, supply=None):
     """Project-level anomalies (id "project:<slug>"), over the open cards of all boards."""
     found = []
     for slug, p in projects.items():
         cards = open_cards.get(slug, [])
         title = f"Project {p['name']} ({p['status']})"
-        if p["status"] == "GEPAUZEERD" and ("f0-done", slug) in intake_done:
+        s = (supply or {}).get(slug) or {}
+        if p["status"] == "ACTIEF" and s.get("n", 0) < SUPPLY_MIN and s.get("plan") and not s.get("busy"):
+            found.append({"id": f"project:{slug}", "title": title, "project": slug, "kind": "voorraad-laag",
+                          "why": f"nog {s.get('n', 0)} coderkaart(en) klaar of startbaar (minimaal {SUPPLY_MIN}); plan nu "
+                                 f"de eerstvolgende {SUPPLY_MIN} bouwkaarten (met volledige kleurplaat, zonder de -00 als "
+                                 "voorganger); niet wachten tot de hele fase gepland is"})
+        if p["status"] == "GEPAUZEERD" and ("f0-done", slug) in intake_done and not EXPLICIT_PAUSE.search(
+                p["file"].read_text(encoding="utf-8", errors="replace")):
             found.append({"id": f"project:{slug}", "title": title, "project": slug, "kind": "akkoord-zonder-actief",
                           "why": "het fasenplan (F0-00) is af en goedgekeurd, maar het project staat nog op GEPAUZEERD; "
                                  "zet STATUS: ACTIEF en maak de kaarten van het eerste blok (incl. -99)"})
@@ -250,15 +327,127 @@ def project_checks(projects, open_cards, intake_done, work=None, capacity=None):
     return found
 
 
+def appointment(reason, now):
+    """True when the reason names a date (ISO or dd-mm[-yyyy]) whose day has not ended yet (NL time)."""
+    today = datetime.fromtimestamp(now, NL)
+    for m in DATE.finditer(reason):
+        y, mo, d = (m.group(1), m.group(2), m.group(3)) if m.group(1) else (m.group(6) or today.year, m.group(5), m.group(4))
+        try:
+            day = datetime(int(y), int(mo), int(d), 23, 59, 59, tzinfo=NL)
+        except ValueError:
+            continue
+        if day.timestamp() > now:
+            return True
+    return False
+
+
+def moving(conn, ids, since):
+    """True when one of the cards ``ids`` makes progress: running, or a run, event (no block) or comment (not the
+    one a block appends) since ``since``."""
+    for i in ids:
+        row = conn.execute("SELECT status FROM tasks WHERE id = ?", (i,)).fetchone()
+        if (row and row["status"] == "running") or conn.execute(
+                "SELECT 1 FROM task_runs WHERE task_id = ? AND (ended_at IS NULL OR started_at > ?) LIMIT 1",
+                (i, since)).fetchone() or conn.execute(
+                f"SELECT 1 FROM task_events WHERE task_id = ? AND created_at > ? AND kind NOT IN "
+                f"({','.join('?' * len(NO_PROGRESS))}) LIMIT 1", (i, since, *NO_PROGRESS)).fetchone() or conn.execute(
+                "SELECT 1 FROM task_comments c WHERE c.task_id = ? AND c.created_at > ? AND NOT EXISTS (SELECT 1 FROM "
+                "task_events e WHERE e.task_id = c.task_id AND e.kind = 'blocked' AND ABS(e.created_at - c.created_at)"
+                " <= 5) LIMIT 1", (i, since)).fetchone():
+            return True
+    return False
+
+
+def cycles(blocked):
+    """Groups of blocked cards whose reasons point at each other (via card ids): [[id, …], …]."""
+    edges = {i: {j for j in CARD_ID.findall(b["reason"]) if j != i and j in blocked} for i, b in blocked.items()}
+
+    def reach(start):
+        seen, todo = set(), list(edges[start])
+        while todo:
+            n = todo.pop()
+            if n not in seen:
+                seen.add(n)
+                todo += edges[n]
+        return seen
+    found = []
+    for i in sorted(blocked):
+        r = reach(i)
+        group = sorted({i} | {j for j in r if i in reach(j)}) if i in r else []
+        if len(group) > 1 and group not in found:
+            found.append(group)
+    return found
+
+
+def first_in_line(group, blocked):
+    """The card of a cycle that goes first: reviewer before security (TEAM.md "Reviewregels"), else the oldest."""
+    for role in ("reviewer", "security"):
+        own = [i for i in group if blocked[i]["assignee"] == role]
+        if own:
+            return min(own, key=lambda i: blocked[i]["created_at"])
+    return min(group, key=lambda i: blocked[i]["created_at"])
+
+
+def block_rule(conn, blocked, specific, waits, now, add):
+    """R2 (one rule for every block) + the wachtkring and the handled inbox item (R3), for one board."""
+    in_cycle = set()
+    for group in cycles({i: b for i, b in blocked.items() if b["actief"]}):  # never wake a paused project
+        first = first_in_line(group, blocked)
+        in_cycle |= set(group)
+        why = "reviewer gaat vóór security" if blocked[first]["assignee"] in ("reviewer", "security") else "oudste kaart"
+        note = (f"Bordbewaking: wachtkring {' ↔ '.join(group)} doorbroken; deze kaart gaat eerst ({why}). "
+                "Volgorde: de reviewer keurt goed op de exacte SHA, daarna pas security (TEAM.md, 'Reviewregels').")
+        unblocks.append((first, note))
+        add(blocked[first], "wachtkring", f"kring {' ↔ '.join(group)} (redenen verwijzen naar elkaar): {first} is "
+            f"gedeblokkeerd ({why}); controleer of de volgorde nu klopt en zet de andere kaart(en) goed")
+    for i, b in blocked.items():
+        reason, r = b["reason"], b["reason"].lower()
+        if i in in_cycle or i in waits or not b["actief"] or r.startswith(PREFIX):
+            continue  # cycle handled; workflow-waits: #meldingen part; owner question: already in #vragen
+        item = INBOX_ITEM.search(reason)
+        if item and (INBOX / "afgehandeld" / f"{item.group(1)}.md").exists() \
+                and not (INBOX / f"{item.group(1)}.md").exists():
+            unblocks.append((i, f"Bordbewaking: workflow-inboxpunt {item.group(1)} is afgehandeld; de kaart gaat verder."))
+            continue
+        if item and (INBOX / f"{item.group(1)}.md").exists():
+            continue  # the workflow side has the item open: that is progress
+        age = now - b["since"]
+        if appointment(reason, now):
+            continue  # waits on an agreed date that has not passed yet (owner 03-10)
+        if age < BLOCK_WAKE or (age < BLOCK_ASK and i in specific):
+            continue  # a kleurplaat/needs_input block already woke the manager at once
+        refs = [j for j in CARD_ID.findall(reason) if j != i]
+        since = max(now - 3600, b["since"] + 60) if not refs else now - 3600
+        if moving(conn, refs or [i], since):
+            continue
+        sort = ("kleurplaat" if r.startswith("kleurplaat onduidelijk") else "kaart" if refs
+                else "toegang" if ACCESS.search(reason) else "overig")
+        owner = "manager"
+        if refs:
+            row = conn.execute("SELECT assignee FROM tasks WHERE id = ?", (refs[0],)).fetchone()
+            owner = f"{(row and row['assignee']) or 'zonder eigenaar'} ({refs[0]})"
+        head = f"staat {int(age // 3600)} u {int(age % 3600 // 60)} min stil zonder voortgang (wacht op: {owner}): '{reason[:120]}'"
+        if age >= BLOCK_ASK:
+            ask = ("dit is workflowwerk, geen vraag voor #vragen: zet het in de workflow-inbox (als dat nog niet "
+                   "gebeurd is) en blokkeer met 'Wacht op workflow-inboxpunt <bestandsnaam>'" if sort == "toegang" else
+                   f"zet nu op deze kaart een vraag voor {OWNER} in het vraagformat (TEAM.md, eerst --check), met wat "
+                   "al geprobeerd is")
+            add(b, "blokkade-vraag", f"{head}. {ask}")
+        else:
+            add(b, "blokkade", f"{head}. Draaiboek: {PLAYBOOK[sort]}")
+
+
 def anomalies(now):
     projects = active_projects(("ACTIEF", "GEPAUZEERD"))
     found = []
-    global holds, bumps
-    holds, bumps = [], []
-    open_cards, intake_done, work = {}, set(), {}
+    global holds, bumps, unblocks, busy
+    holds, bumps, unblocks = [], [], []
+    open_cards, intake_done, work, supply = {}, set(), {}, {}
     running = {"total": 0, "coder": 0, "last_end": 0}
+    waits = workflow_waits()
     for board, db in boards():
         conn = kanban(db)
+        blocked, specific = {}, set()
         for r in conn.execute("SELECT assignee, COUNT(*) AS n FROM tasks WHERE status = 'running' GROUP BY assignee"):
             running["total"] += r["n"]
             running["coder"] += r["n"] if r["assignee"] == BUILDER else 0
@@ -270,8 +459,11 @@ def anomalies(now):
             workflow = title.lower().startswith("workflow:")
             slug = project_of(t, projects)
 
-            def add(kind, why):
-                found.append({"id": t["id"], "title": title, "project": slug or "-", "kind": kind, "why": why})
+            def add(kind, why, card=None):
+                c = card or {"id": t["id"], "title": title, "project": slug or "-"}
+                found.append({"id": c["id"], "title": c["title"], "project": c["project"], "kind": kind, "why": why})
+                if kind in SPECIFIC_BLOCKS:
+                    specific.add(c["id"])
 
             if workflow:
                 add("workflow-kaart", "workflowpunten staan niet op het bord: zet dit als bestand in "
@@ -282,6 +474,14 @@ def anomalies(now):
             if not slug:
                 continue
             open_cards.setdefault(slug, []).append(title)
+            s = supply.setdefault(slug, {"n": 0, "plan": False, "busy": False})
+            if t["assignee"] == BUILDER and (t["status"] == "ready" or t["status"] == "todo" and not conn.execute(
+                    "SELECT 1 FROM task_links l JOIN tasks p ON p.id = l.parent_id WHERE l.child_id = ? AND p.status "
+                    "NOT IN ('done', 'archived')", (t["id"],)).fetchone()):
+                s["n"] += 1
+            s["plan"] |= bool(PLAN_CODE.match(title)) or (t["assignee"] == MANAGER and t["status"] == "todo"
+                                                         and not REVIEWISH.match(title) and not DECISION.match(title))
+            s["busy"] |= t["assignee"] == MANAGER and t["status"] == "running"
             if t["status"] in ("ready", "running", "review"):
                 work[slug] = True
             if (t["status"] in ("ready", "review") and (t["priority"] or 0) < REVIEW_PRIORITY
@@ -291,7 +491,13 @@ def anomalies(now):
                                      "('commented', 'heartbeat')", (t["id"],)).fetchone()[0] or t["created_at"]
                 if now - moved > REVIEW_WAIT:
                     bumps.append(t["id"])
-            if t["model_override"] and t["model_override"] not in ALLOWED_OVERRIDES:  # only the escalation model (TEAM.md)
+            fixed = None if t["project_id"] in PINNED else project_model(slug, t["assignee"])  # pinned by the fork: no card check
+            if fixed and t["model_override"] != fixed:  # project with a fixed model (flow config projecten[].model)
+                add("model-override", f"project {slug} heeft een vast model '{fixed}' (besluit {fc.owner_name()}), deze kaart heeft "
+                    f"'{t['model_override'] or 'geen override'}'; zet het vaste model (hermes kanban --board {BOARD} set-model "
+                    "<id> <model> --provider <provider> uit het projectbestand); geen ander model, ook geen escalatie")
+            elif not fixed and t["project_id"] not in PINNED and t["model_override"] \
+                    and t["model_override"] not in ALLOWED_OVERRIDES:  # only the escalation model (pinned: the fork decides)
                 add("model-override", f"kaart heeft model-override '{t['model_override']}': die geldt ook voor de review; "
                     f"haal hem weg (hermes kanban --board {BOARD} set-model <id> none)")
             if t["status"] == "triage":
@@ -338,10 +544,13 @@ def anomalies(now):
                 last = conn.execute("SELECT kind FROM task_events WHERE task_id = ? AND kind != 'commented' "
                                     "ORDER BY id DESC LIMIT 1", (t["id"],)).fetchone()
                 if last and last["kind"] == "gave_up":
-                    if not UNAVAILABLE.search(t["last_failure_error"] or ""):  # a storing: stuck-check reports it once
+                    if not UNAVAILABLE.search(t["last_failure_error"] or ""):  # a storing: reported once in #meldingen
                         add("mislukt-2x", "twee keer mislukt (geen storing): pas de escalatieregel toe (kleurplaat "
                             "herschrijven of overnemen), fout: " + (t["last_failure_error"] or "?")[:160])
                     continue
+                blocked[t["id"]] = {"id": t["id"], "title": title, "project": slug, "reason": reason, "since": since,
+                                    "assignee": t["assignee"], "created_at": t["created_at"],
+                                    "actief": projects[slug]["status"] == "ACTIEF"}
                 if r.startswith("kleurplaat onduidelijk"):
                     big = TOO_BIG.search(reason)
                     m = MAX_LINES.search(t["body"] or "")
@@ -355,10 +564,6 @@ def anomalies(now):
                     else:
                         add("kleurplaat-onduidelijk", "de bouwer vraagt verduidelijking (gaat vóór je eigen planwerk): "
                             + reason[len("kleurplaat onduidelijk"):].strip(" :")[:200])
-                    continue
-                if decision and now - since >= DECISION_WAIT:
-                    add("beslissing-manager", f"wacht al {int((now - since) // 60)} min op jouw beslissing (gaat vóór je "
-                        "eigen planwerk; SOUL 'Vastlopen'): " + reason[:160])
                     continue
                 if wait:
                     run = conn.execute("SELECT summary FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
@@ -384,33 +589,236 @@ def anomalies(now):
                                    (t["id"],)).fetchone()
                 if run and now - (run["started_at"] or now) > RUNNING_TOO_LONG:
                     add("te-lang-running", f"draait al {int((now - run['started_at']) / 3600)} uur in één run")
+        block_rule(conn, blocked, specific, waits, now, lambda card, kind, why: found.append(
+            {"id": card["id"], "title": card["title"], "project": card["project"], "kind": kind, "why": why}))
         found += decision_checks(conn, projects, intake_done, now)
     capacity = {"free": running["total"] < HOST_CAP and running["coder"] < CODER_CAP
                 and now - running["last_end"] >= IDLE_AFTER}
-    return found + project_checks(projects, open_cards, intake_done, work, capacity)
+    busy = {slug for slug, s in supply.items() if s["busy"]}  # a manager card of that project runs: no wake-up
+    return found + project_checks(projects, open_cards, intake_done, work, capacity, supply) + old_messages()
 
 
-def escalation_text(a, age):
-    hours = int(age // 3600)
-    if a["kind"] not in MANAGER_KINDS:
-        return fc.text("bordbewaking.escalatie", id=a["id"], titel=a["title"][:80], project=a["project"], waarom=a["why"],
-                       uren=hours)
-    ch = dp.channels()
-    link = f"https://discord.com/channels/{ch.get('guild')}/{ch.get('chatlog')}"
-    return fc.text("bordbewaking.escalatie_manager", id=a["id"], titel=a["title"][:80], project=a["project"], uren=hours,
-                   link=link)
+def old_messages():
+    """Niet-opgeloste #meldingen-melding ouder dan 14 dagen (discord-cleanup.py zet "melding-oud:<id>"): één keer
+    naar de manager; na de wekker (guard:<id>:melding-oud woken) niet meer."""
+    out = []
+    for key, info in dp.events_matching("melding-oud:").items():
+        mid = f"melding-{key.split(':', 1)[1]}"
+        if (dp.event_get(f"guard:{mid}:melding-oud") or {}).get("woken"):
+            continue
+        out.append({"id": mid, "title": info.get("tekst", "")[:80], "project": "-", "kind": "melding-oud",
+                    "why": f"melding in #meldingen sinds {info.get('sinds', '?')} niet opgelost"
+                           + (f" (kaart {info['card']})" if info.get("card") else "")
+                           + "; los het op of zet een workflowpunt in de inbox. De melding blijft staan."})
+    return out
+
+
+# --- #meldingen (was kanban-stuck-check.py): time signals and failed runs, one message per episode ---
+TRIAGE_SECONDS = int(D["triage_min"] * 60)
+TODO_SECONDS = int(D["todo_min"] * 60)
+READY_SECONDS = int(D["ready_uur"] * 3600)
+SLOT_FREE_SECONDS = 10 * 60  # no run ended this recently: a free slot is not just a dispatcher tick behind
+PROFILE_CAP = dict(fc.get("rollen.max_per_rol") or {})  # mirrors the dispatcher (1 per profile unless listed)
+FAIL_KINDS = {"crashed": "gecrasht", "timed_out": "time-out", "gave_up": "opgegeven na herhaalde fouten"}
+FAIL_WINDOW = 24 * 3600
+
+
+def _last_move(conn, t):
+    row = conn.execute("SELECT MAX(created_at) FROM task_events WHERE task_id = ? AND kind != 'commented'",
+                       (t["id"],)).fetchone()
+    return row[0] or t["created_at"]
+
+
+def workflow_waits():
+    path = fc.path("workflow_waits")
+    try:
+        return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _unit(name, props):
+    out = subprocess.run(["systemctl", "--user", "show", name, "-p", ",".join(props)],
+                         capture_output=True, text=True, timeout=30, check=True).stdout
+    return dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+
+
+def workflow_verdict(unit):
+    """None while the workflow run is still going (skip the card), else ``(kind, text)`` to report."""
+    try:
+        svc = _unit(f"{unit}.service", ("ActiveState", "SubState", "Result", "ExecMainStatus"))
+        tmr = _unit(f"{unit}.timer", ("ActiveState",))
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return "onbekend", f"status van workflowrun {unit} onleesbaar"
+    if svc.get("SubState") == "auto-restart":
+        return None  # systemd restarts it itself
+    if svc.get("Result", "success") != "success":
+        return "mislukt", f"workflowrun {unit} mislukt ({svc.get('Result')}, exit {svc.get('ExecMainStatus')})"
+    if tmr.get("ActiveState") == "active" or svc.get("ActiveState") in ("active", "activating", "reloading"):
+        return None
+    return "klaar", f"workflowrun {unit} klaar (exit {svc.get('ExecMainStatus')}), kaart staat nog blocked"
+
+
+def slots(conns):
+    """Host-wide running workers: ``{"total", "per", "last_end", "cap"}`` over every board DB."""
+    per, last_end = {}, 0
+    for conn in conns:
+        for r in conn.execute("SELECT assignee, COUNT(*) FROM tasks WHERE status = 'running' GROUP BY assignee"):
+            per[r[0]] = per.get(r[0], 0) + r[1]
+        last_end = max(last_end, conn.execute("SELECT MAX(ended_at) FROM task_runs").fetchone()[0] or 0)
+    try:
+        m = re.search(r"^kanban:\n(?:[ \t]+.*\n)*?[ \t]+max_in_progress:\s*(\d+)\s*$",
+                      (HOME / "config.yaml").read_text(encoding="utf-8"), re.M)
+        cap = int(m.group(1)) if m else HOST_CAP
+    except OSError:
+        cap = HOST_CAP
+    return {"total": sum(per.values()), "per": per, "last_end": last_end, "cap": cap}
+
+
+def stuck_cards(now):
+    """Cards that stand still on time signals (ACTIEF projects): [{id, title, project, why, since, episode, quiet}]."""
+    projects = active_projects()
+    conns = [(board, kanban(db)) for board, db in boards()]
+    legacy = HOME / "kanban.db"
+    host = slots([c for _b, c in conns] + ([kanban(legacy)] if legacy.exists() else []))
+    waits, found = workflow_waits(), []
+    for board, conn in conns:
+        for t in conn.execute("SELECT id, title, status, assignee, project_id, workspace_path, created_at FROM tasks "
+                              "WHERE status IN ('blocked', 'triage', 'todo', 'ready')"):
+            slug = project_of(t, projects)
+            if not slug or (t["title"] or "").lower().startswith("workflow:"):
+                continue
+            quiet, since = False, _last_move(conn, t)
+            if t["status"] == "triage" and now - since > TRIAGE_SECONDS:
+                why = "staat in triage; niemand pakt dit vanzelf op"
+            elif t["status"] == "todo":
+                parents = conn.execute("SELECT p.status, p.completed_at FROM task_links l JOIN tasks p ON "
+                                       "p.id = l.parent_id WHERE l.child_id = ?", (t["id"],)).fetchall()
+                if any(p["status"] not in ("done", "archived") for p in parents):
+                    continue  # waits on an open parent: normal
+                since = max([since] + [p["completed_at"] or 0 for p in parents])
+                if now - since <= TODO_SECONDS:
+                    continue
+                why = "todo terwijl alle voorgangers klaar zijn; niet gestart"
+            elif t["status"] == "ready" and t["assignee"] and now - since > READY_SECONDS:
+                # slot busy: quiet, but keep the episode so a slot that frees up later does not report it again
+                quiet = not (host["total"] < host["cap"] and host["per"].get(t["assignee"], 0)
+                             < PROFILE_CAP.get(t["assignee"], 1) and now - host["last_end"] > SLOT_FREE_SECONDS)
+                why = f"ready terwijl er een plek vrij is ({t['assignee']})"
+            elif t["status"] == "blocked" and t["id"] in waits:
+                verdict = workflow_verdict(waits[t["id"]].get("unit", ""))
+                if verdict is None:
+                    continue  # waits on a scheduled workflow run: not stuck
+                kind, why = verdict
+                since = conn.execute("SELECT MAX(created_at) FROM task_events WHERE task_id = ? AND kind = 'blocked'",
+                                     (t["id"],)).fetchone()[0] or t["created_at"]
+                found.append({"id": t["id"], "title": t["title"], "project": slug, "why": why, "since": int(since),
+                              "episode": f"{board}:{t['id']}:workflow:{waits[t['id']].get('unit')}:{kind}"})
+                continue
+            else:
+                continue  # blocks: the block rule (manager); running too long: te-lang-running
+            found.append({"id": t["id"], "title": t["title"], "project": slug, "why": why, "since": int(since),
+                          "episode": f"{board}:{t['id']}:{t['status']}:{int(since)}", "quiet": quiet})
+    return found
+
+
+def message(card):
+    why = card["why"] if len(card["why"]) <= 200 else card["why"][:197] + "..."
+    return (f"{fc.text('vastgelopen.vastgelopen')}: {card['id']} {card['title']} ({card['project']}) — {why}, "
+            f"sinds {fc.tijd(card['since'])}")
+
+
+def event_key(card):
+    return f"{card['id']}:vastgelopen:" + card["episode"].split(":", 2)[2]
+
+
+def failed_cards(now):
+    """Runs that crashed, timed out or gave up in the last 24 h (ACTIEF projects): one message per event."""
+    projects, found = active_projects(), []
+    for _board, db in boards():
+        for e in kanban(db).execute(
+                "SELECT e.id, e.kind, e.task_id, t.title, t.project_id, t.workspace_path, t.last_failure_error, "
+                "t.assignee FROM task_events e JOIN tasks t ON t.id = e.task_id "
+                f"WHERE e.kind IN ({','.join('?' * len(FAIL_KINDS))}) AND e.created_at > ?", (*FAIL_KINDS, now - FAIL_WINDOW)):
+            slug = project_of(e, projects)
+            if slug:
+                why = FAIL_KINDS[e["kind"]] + (f": {e['last_failure_error'][:150]}" if e["last_failure_error"] else "")
+                found.append({"id": e["task_id"], "title": e["title"], "project": slug, "why": why,
+                              "key": f"{e['task_id']}:mislukt:{e['id']}",
+                              "unavailable": e["assignee"] == BUILDER and bool(UNAVAILABLE.search(e["last_failure_error"] or ""))})
+    return found
+
+
+def report(now, dry):
+    """#meldingen (ping): stuck episodes, failed runs, builder unavailable; never twice (event register)."""
+    send = (lambda text: print("zou melden (#meldingen): " + text)) if dry else \
+        (lambda text: dp.send(dp.channels()["meldingen"], text, ping=True))
+    for card in stuck_cards(now):
+        key = event_key(card)
+        if not card.get("quiet") and not dp.event_seen(key):
+            msg = send(message(card))
+            if not dry:
+                dp.event_mark(key, channel=msg["channel_id"], message=msg["id"], episode=card["episode"],
+                              text=msg["content"], card=card["id"])
+    fails = [f for f in failed_cards(now) if not dp.event_seen(f["key"])]
+    down = [f for f in fails if f["unavailable"]]
+    key = f"bouwer-onbeschikbaar:{int(now // (6 * 3600))}"
+    if down and not dp.event_seen(key):  # builder unavailable: ONE message per 6-hour window, never another model
+        msg = send(fc.text("vastgelopen.bouwer_onbeschikbaar", aantal=len(down),
+                           kaarten=", ".join(sorted({f["id"] for f in down})[:5])))
+        if not dry:
+            dp.event_mark(key, channel=msg["channel_id"], message=msg["id"], text=msg["content"])
+    for f in fails:
+        if f["unavailable"]:
+            if not dry:
+                dp.event_mark(f["key"], grouped=key)
+            continue
+        msg = send(fc.text("vastgelopen.mislukt", id=f["id"], titel=f["title"], project=f["project"], waarom=f["why"]))
+        if not dry:
+            dp.event_mark(f["key"], channel=msg["channel_id"], message=msg["id"], text=msg["content"], card=f["id"])
 
 
 def wake_manager(items):
     lines = "\n".join(f"- {a['id']} [{a['project']}] {a['title'][:80]}: {a['kind']} — {a['why']}" for a in items)
     prompt = ("Bordbewaking (automatisch, van de workflowkant). Deze kaarten wijken af; los ze op volgens je SOUL "
-              "('Bordbewaking'). Je zit in een CLI-sessie: post niets in Discord. Een workflowfout zet je als bestand in "
-              "~/.hermes/workflow-inbox/ (LEESMIJ.md), nooit als kaart of melding. Blokkades die op jouw beslissing "
-              "wachten (kleurplaat-onduidelijk, verkeerd-maximum, beslissing-manager) los je eerst op, vóór je eigen planwerk.\n"
-              + lines)
+              "('Bordbewaking'). Je zit in een CLI-sessie: post niets in Discord, behalve een vraag voor "
+              f"{OWNER} via een kaartblokkade in het vraagformat. Een workflowfout zet je als bestand in "
+              "~/.hermes/workflow-inbox/ (LEESMIJ.md), nooit als kaart of melding. Blokkades, een wachtkring en een te "
+              "lage codervoorraad los je eerst op, vóór je eigen planwerk.\n" + lines)
     r = subprocess.run([HERMES, "chat", "-Q", "-q", prompt], capture_output=True, text=True, timeout=1800,
                        env={"HOME": str(Path.home()), "PATH": f"{Path.home()}/.local/bin:/usr/bin:/bin"})
     return r.returncode, (r.stdout or "")[-1500:]
+
+
+def kanban_cmd(*args):
+    return subprocess.run([HERMES, "kanban", "--board", BOARD, *args], capture_output=True, text=True, timeout=120,
+                          env={"HOME": str(Path.home()), "PATH": f"{Path.home()}/.local/bin:/usr/bin:/bin"}).returncode
+
+
+def due(a, now):
+    """Woken again for the same card and kind: blocks, cycle and supply every hour, the rest every 6 hours."""
+    info = dp.event_get(f"guard:{a['id']}:{a['kind']}") or {}
+    return now - float(info.get("woken", 0)) >= (MANAGER_REWAKE if a["kind"] in MANAGER_KINDS else REPEAT)
+
+
+def bundles(found, now, running=()):
+    """{project: [items, most urgent first]}: ONE wake-up per project per round (owner 03-10: the manager is the most
+    expensive role). The per-item rules (``due``) decide what is in it; a project is woken at most once per
+    BUNDLE_GAP, unless a direct item (DIRECT) is new since its last wake-up; never while a manager card of the
+    project runs (``running``; the items stay for the next round)."""
+    out = {}
+    for a in found:
+        if due(a, now):
+            out.setdefault(a["project"], []).append(a)
+    for slug in list(out):
+        last = float((dp.event_get(f"guard-project:{slug}") or {}).get("woken", 0))
+        new_direct = any(a["kind"] in DIRECT and not (dp.event_get(f"guard:{a['id']}:{a['kind']}") or {}).get("woken")
+                         for a in out[slug])
+        if slug in running or (now - last < BUNDLE_GAP and not new_direct):
+            del out[slug]
+        else:
+            out[slug].sort(key=lambda a: URGENCY.index(a["kind"]) if a["kind"] in URGENCY else len(URGENCY))
+    return out
 
 
 def log(line):
@@ -422,44 +830,36 @@ def log(line):
 def main():
     now = time.time()
     found = anomalies(now)
-    if "--dry-run" in sys.argv and holds:
-        print("zou tegenhouden: " + ", ".join(t for t, _r in holds))
-    if "--dry-run" in sys.argv and bumps:
-        print("zou voorrang geven (prioriteit 10): " + ", ".join(bumps))
     if "--dry-run" in sys.argv:  # read-only: no lock, so it never waits on a running guard
+        for label, items in (("zou tegenhouden", [t for t, _r in holds]), ("zou voorrang geven (prioriteit 10)", bumps),
+                             ("zou deblokkeren", [t for t, _n in unblocks])):
+            if items:
+                print(f"{label}: " + ", ".join(items))
+        report(now, dry=True)
         for a in found:
             print(f"{a['id']} [{a['project']}] {a['kind']}: {a['why']} | {a['title'][:70]}")
         print(f"{len(found)} afwijking(en)")
+        woken = bundles(found, now, busy)
+        for slug in sorted({a["project"] for a in found}):
+            items = woken.get(slug)
+            print(f"wekker [{slug}]: " + (f"1 ({', '.join(a['id'] + ':' + a['kind'] for a in items)})" if items else
+                                          "geen" + (" (managerrun loopt)" if slug in busy else " (nog niet aan de beurt)")))
         return
     _lock = dp.single_instance("board-guard")  # noqa: F841 (held until exit)
     for task_id in bumps:  # review/herreview/end-check waiting > 15 min: before new build cards
-        r = subprocess.run([HERMES, "kanban", "--board", BOARD, "edit", task_id, "--priority", str(REVIEW_PRIORITY)],
-                           capture_output=True, text=True, timeout=120,
-                           env={"HOME": str(Path.home()), "PATH": f"{Path.home()}/.local/bin:/usr/bin:/bin"})
-        log(f"voorrang {task_id}: prioriteit {REVIEW_PRIORITY} (exit {r.returncode})")
+        log(f"voorrang {task_id}: prioriteit {REVIEW_PRIORITY} (exit {kanban_cmd('edit', task_id, '--priority', str(REVIEW_PRIORITY))})")
     for task_id, reason in holds:  # hold back build cards with an incomplete kleurplaat before they start
-        r = subprocess.run([HERMES, "kanban", "--board", BOARD, "block", task_id, reason], capture_output=True,
-                           text=True, timeout=120, env={"HOME": str(Path.home()), "PATH": f"{Path.home()}/.local/bin:/usr/bin:/bin"})
-        log(f"tegengehouden {task_id}: {reason} (exit {r.returncode})")
-    due = []
-    for a in found:
-        info = dp.event_get(f"guard:{a['id']}:{a['kind']}") or {}
-        manager = a["kind"] in MANAGER_KINDS
-        if now - float(info.get("woken", 0)) >= (MANAGER_REWAKE if manager else REPEAT):
-            due.append(a)
-        if info.get("woken") and now - float(info["first"]) >= (MANAGER_ESCALATE if manager else REPEAT) \
-                and not info.get("escalated"):
-            msg = dp.send(dp.channels()["meldingen"], escalation_text(a, now - float(info["first"])), ping=True)
-            dp.event_mark(f"guard:{a['id']}:{a['kind']}", escalated=now, message=msg["id"], channel=msg["channel_id"],
-                          text=msg["content"], card=a["id"])
-    if not due:
-        return
-    for a in due:
-        info = dp.event_get(f"guard:{a['id']}:{a['kind']}") or {}
-        dp.event_mark(f"guard:{a['id']}:{a['kind']}", woken=now, first=info.get("first", now), card=a["id"])
-    log("manager gewekt: " + "; ".join(f"{a['id']}:{a['kind']}" for a in due))
-    code, out = wake_manager(due)
-    log(f"manager klaar (exit {code}): {out.strip().splitlines()[-1][:300] if out.strip() else '-'}")
+        log(f"tegengehouden {task_id}: {reason} (exit {kanban_cmd('block', task_id, reason)})")
+    for task_id, note in unblocks:  # wachtkring broken / workflow-inbox item handled
+        log(f"gedeblokkeerd {task_id}: {note} (exit {kanban_cmd('unblock', '--reason', note, task_id)})")
+    report(now, dry=False)
+    for slug, items in bundles(found, now, busy).items():
+        for a in items:
+            dp.event_mark(f"guard:{a['id']}:{a['kind']}", woken=now, card=a["id"])
+        dp.event_mark(f"guard-project:{slug}", woken=now)
+        log(f"manager gewekt [{slug}]: " + "; ".join(f"{a['id']}:{a['kind']}" for a in items))
+        code, out = wake_manager(items)
+        log(f"manager klaar [{slug}] (exit {code}): {out.strip().splitlines()[-1][:300] if out.strip() else '-'}")
 
 
 if __name__ == "__main__":

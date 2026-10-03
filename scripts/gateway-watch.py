@@ -4,7 +4,7 @@ gateway, so it also works while the gateway is down). Posts to #meldingen with a
 - the gateway restarted UNEXPECTEDLY (crash with automatic restart, server reboot, or stopped and
   started without a planned-restart marker);
 - the gateway has been down for more than 2 minutes (and once more when it is back).
-Planned restarts are silent: ``gateway-planned-restart.sh`` writes the marker
+Planned restarts are silent: ``drain-restart.py --gepland`` writes the marker
 ~/.hermes/state/gateway-planned-restart.json first; a chat /restart leaves ~/.hermes/.restart_pending.json.
 The first run records the current state silently. State: ~/.hermes/state/gateway-watch.json.
 """
@@ -18,7 +18,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import discord_post as dp  # noqa: E402
 import flow_config as fc  # noqa: E402
-from team_projects import HOME  # noqa: E402
+from flow_config import HOME  # noqa: E402
 
 UNIT = fc.get("gateway.unit")
 STATE = HOME / "state" / "gateway-watch.json"
@@ -29,8 +29,8 @@ DOWN_ALERT_AFTER = int(fc.get("drempels.gateway_plat_na_s"))
 
 
 def unit_state() -> dict:
-    out = subprocess.run(["systemctl", "--user", "show", UNIT, "-p",
-                          "ActiveState,SubState,InvocationID,NRestarts,ActiveEnterTimestamp"],
+    out = subprocess.run(fc.systemctl_gateway("show", UNIT, "-p",
+                          "ActiveState,SubState,InvocationID,NRestarts,ActiveEnterTimestamp"),
                          capture_output=True, text=True, timeout=30, check=True).stdout
     return dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
 

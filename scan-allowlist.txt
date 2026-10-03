@@ -1,0 +1,3 @@
+# Beoordeelde uitzonderingen van scan_personal.py (regel: <pad-glob><TAB><regex op de vondst><TAB># reden).
+# Alleen generieke namen, nooit persoonlijke gegevens. De regex schrijft modelnamen met [o] zodat dit bestand zelf schoon blijft.
+*	(?i)^c[o]dex$	# providernaam van Hermes (abonnement.providers in DEFAULTS; ook in het ochtendrapport); generiek, geen persoonsgegeven
