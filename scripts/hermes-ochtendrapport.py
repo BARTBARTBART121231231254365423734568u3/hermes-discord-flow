@@ -274,6 +274,16 @@ def teamcijfers(kb, sessies, now, dagen):
     coder = [r for r in inr if r["profile"] == "coder"]
     echt = [r for r in coder if r["ended_at"] > r["started_at"]]
     c.update(coder_alle=len(coder), coder_echt=len(echt), coder_blok=sum(1 for r in echt if r["outcome"] == "blocked"))
+    # coder op Claude (besluit eigenaar 03-10): escalatie = model_override_set op de kaart vóór de sessie, anders terugval
+    esc = dict(kb.execute("SELECT task_id, MIN(created_at) FROM task_events WHERE kind = 'model_override_set' GROUP BY task_id"))
+    cs = [(r, x) for r in coder for x in per_run.get(r["id"], [])]
+    claude = lambda m: "claude" in (m or "").lower()  # noqa: E731  (model of abonnement; geen modelnamen in code)
+    cl = [(r, x) for r, x in cs if claude(x.get("model")) or claude(x.get("prov"))]
+    rt = {t: f"{_js(p).get('model')} {_js(p).get('provider')}" for t, p in kb.execute(
+        "SELECT task_id, payload FROM task_events WHERE kind = 'model_routing' ORDER BY created_at, rowid")}
+    n_esc = sum(1 for r, x in cl if esc.get(r["task_id"], 2e9) <= x["started_at"])
+    n_inst = sum(1 for r, x in cl if esc.get(r["task_id"], 2e9) > x["started_at"] and claude(rt.get(r["task_id"])))
+    c.update(coder_sess=len(cs), coder_claude=len(cl), coder_esc=n_esc, coder_inst=n_inst, coder_terug=len(cl) - n_esc - n_inst)
     return c
 
 
@@ -285,8 +295,10 @@ def lees_sessies(since):
             continue
         for r in fc.connect_ro(db).execute(
                 "SELECT id, started_at, api_call_count, COALESCE(input_tokens,0) + COALESCE(cache_read_tokens,0) "
-                "+ COALESCE(output_tokens,0) FROM sessions WHERE source = 'kanban' AND started_at >= ?", (since,)):
-            uit.append(dict(id=r[0], profile=prof, started_at=float(r[1]), calls=r[2] or 0, tokens=r[3] or 0))
+                "+ COALESCE(output_tokens,0), COALESCE(model,''), COALESCE(billing_provider,'') FROM sessions "
+                "WHERE source = 'kanban' AND started_at >= ?", (since,)):
+            uit.append(dict(id=r[0], profile=prof, started_at=float(r[1]), calls=r[2] or 0, tokens=r[3] or 0, model=r[4],
+                            prov=r[5]))
     return uit
 
 
@@ -316,6 +328,8 @@ def teamcijfers_lines(d, w):
         f"calls mediaan {_f(w['calls_med'], 0)}",
         f"- geblokkeerde coder-runs: {blokpct(d)} | {blokpct(w)} ({d['coder_blok']}/{d['coder_echt']} | "
         f"{w['coder_blok']}/{w['coder_echt']})",
+        f"- coder op Claude (7 d): {w['coder_claude']}/{w['coder_sess']} sessies — escalatie {w['coder_esc']}, "
+        f"ingesteld {w['coder_inst']}, terugval {w['coder_terug']} (kost Claude-limiet)",
         "",
         "**Berekening** (bron · filter · controle)",
         f"- klaar: tasks.completed_at in venster (ook later gearchiveerd) · controle: kaarten met event 'completed' {d['klaar_ev']} | "
@@ -334,6 +348,8 @@ def teamcijfers_lines(d, w):
         f"- tokens: in + cache + uit van kanban-sessies, gekoppeld aan runs op starttijd (±5 s, zelfde profiel) · "
         f"controle: {w['tok_n']}/{w['klaar']} kaarten met sessie, worker_session_id klopt {w['id_klopt']}/{w['id_n']} "
         f"(doel ≥ 95%) {ok(w['tok_n'] + w['zonder_sessie'] == w['klaar'] and w['id_klopt'] >= 0.95 * w['id_n'])}",
+        f"- coder op Claude: sessies van coder-runs met een Claude-model; escalatie = override vóór de sessie, ingesteld = routing koos Claude, anders terugval · "
+        f"controle: escalatie {w['coder_esc']} ≤ Claude {w['coder_claude']} ≤ sessies {w['coder_sess']} {ok(w['coder_esc'] <= w['coder_claude'] <= w['coder_sess'])}",
         f"- coder-runs: outcome blocked / runs met ended_at > started_at · controle: {w['coder_echt']} echt + "
         f"{w['coder_alle'] - w['coder_echt']} preflight-stops = {w['coder_alle']} "
         f"{ok(w['coder_blok'] <= w['coder_echt'] <= w['coder_alle'])}",
